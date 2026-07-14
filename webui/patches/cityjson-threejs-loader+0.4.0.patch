@@ -1,0 +1,39 @@
+diff --git a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js
+index e0f5ce8..ad9483a 100644
+--- a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js
++++ b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js
+@@ -12,7 +12,7 @@ export class CityObjectsInstancedMesh extends InstancedMesh {
+ 
+ 		const vertexArray = new Float32Array( vertices );
+ 		geom.setAttribute( 'position', new BufferAttribute( vertexArray, 3 ) );
+-		const idsArray = new Uint16Array( instanceData.objectIds );
++		const idsArray = new Float32Array( instanceData.objectIds );
+ 		geom.setAttribute( 'objectid', new InstancedBufferAttribute( idsArray, 1 ) );
+ 		const typeArray = new Int32Array( instanceData.objectType );
+ 		geom.setAttribute( 'type', new InstancedBufferAttribute( typeArray, 1 ) );
+diff --git a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsMesh.js b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsMesh.js
+index a26160f..791d618 100644
+--- a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsMesh.js
++++ b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsMesh.js
+@@ -11,7 +11,7 @@ export class CityObjectsMesh extends Mesh {
+ 
+ 		const vertexArray = new Float32Array( vertices );
+ 		geom.setAttribute( 'position', new BufferAttribute( vertexArray, 3 ) );
+-		const idsArray = new Uint16Array( geometryData.objectIds );
++		const idsArray = new Float32Array( geometryData.objectIds );
+ 		geom.setAttribute( 'objectid', new BufferAttribute( idsArray, 1 ) );
+ 		const typeArray = new Uint8Array( geometryData.objectType );
+ 		geom.setAttribute( 'type', new Int32BufferAttribute( typeArray, 1 ) );
+diff --git a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsPoints.js b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsPoints.js
+index c7de5e3..9c835d7 100644
+--- a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsPoints.js
++++ b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsPoints.js
+@@ -11,7 +11,7 @@ export class CityObjectsPoints extends Points {
+ 
+ 		const vertexArray = new Float32Array( vertices );
+ 		geom.setAttribute( 'position', new BufferAttribute( vertexArray, 3 ) );
+-		const idsArray = new Uint16Array( geometryData.objectIds );
++		const idsArray = new Float32Array( geometryData.objectIds );
+ 		geom.setAttribute( 'objectid', new BufferAttribute( idsArray, 1 ) );
+ 		const typeArray = new Uint8Array( geometryData.objectType );
+ 		geom.setAttribute( 'type', new Int32BufferAttribute( typeArray, 1 ) );

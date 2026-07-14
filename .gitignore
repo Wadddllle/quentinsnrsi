@@ -1,0 +1,45 @@
+# --- Vendored/nested repos (each has its own .git, not meant to be tracked here) ---
+/ninja/
+/onemap-slicer/
+/buildings.city/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Node / web ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# --- Editors / OS ---
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# --- Claude Code local state ---
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# --- LaTeX build output (keep the .tex sources) ---
+doc/*.aux
+doc/*.fdb_latexmk
+doc/*.fls
+doc/*.log
+doc/*.pdf
+
+# --- Large / generated datasets (raw downloads, backups, pipeline outputs) ---
+/data/
+/hdb.json
+/sg_buildings_v5.geojson
+/NationalMapLine.geojson
+/onemap_landmarks/exports/
+/onemap_landmarks/renders/

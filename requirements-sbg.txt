@@ -1,0 +1,17 @@
+shapely
+pyproj
+numpy
+scipy
+rasterio
+cjio
+ijson
+matplotlib
+folium
+trimesh
+triangle
+DracoPy
+pygltflib
+pymeshfix
+fastapi
+uvicorn
+orjson
