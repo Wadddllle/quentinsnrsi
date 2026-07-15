@@ -1,0 +1,611 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta}
+
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!50!black, citecolor=blue!50!black}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{SBG: A CityJSON Pipeline for Town-Scale Building Geometry\\
+\large Backend Logic, Phases 0--5}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes the logic of SBG (Singapore Building Geometry), a pipeline that
+turns raw open building footprint and elevation data into a spec-valid CityJSON dataset,
+and ultimately into a watertight solid mesh suitable for meshing into a computational fluid
+dynamics (CFD) domain for town-scale radionuclide plume dispersion modelling. It covers the
+mathematics and algorithms behind each processing phase --- extrusion, height backfill,
+domain cutout, terrain draping, editing, and solid export --- independent of the specific
+libraries or source code used to implement them. Web interface and interactive tooling are
+out of scope; this is a description of the backend's reasoning, not its code.
+\end{abstract}
+
+\tableofcontents
+
+\section{Overview}
+
+The pipeline consumes three heterogeneous open-data sources for Singapore --- a 2D building
+footprint layer with inconsistent height attribution, a government building register with
+authoritative but sparse measured heights, and a coarse (20\,m interval) contour layer --- and
+produces a single coherent 3D dataset. All internal geometry uses EPSG:3414 (SVY21), the
+official Singapore projected coordinate system, in metres; all inputs are reprojected once at
+ingest and degrees are never carried past that boundary.
+
+Six phases build on one another:
+
+\begin{enumerate}[label=\textbf{Phase \arabic*.}, leftmargin=1.6cm]
+  \item \textbf{Extrusion.} Turn each 2D footprint and a resolved scalar height into a
+    Level-of-Detail~1 (LoD1) prismatic solid.
+  \item \textbf{Height backfill.} Replace estimated heights with authoritative measured
+    heights wherever a government register match exists, and keep the 3D geometry consistent
+    with that correction.
+  \item \textbf{Cutout.} Extract the subset of buildings fully inside an arbitrary
+    user-specified domain boundary.
+  \item \textbf{Terrain overlay.} Drape the domain's buildings and a locally-triangulated
+    terrain surface onto each other so they share an exact, gap-free seam.
+  \item \textbf{Editing.} Add or remove individual buildings from an existing dataset without
+    reprocessing the whole file.
+  \item \textbf{Solid export.} Fuse the domain's buildings and terrain into a single watertight
+    solid and simplify it to a resolution matching the downstream CFD mesh.
+\end{enumerate}
+
+A recurring theme, revisited throughout, is that \emph{correctness at the seams} --- where one
+building's geometry meets another's, or where a building meets the terrain --- is harder than
+it looks, and several early, more ``obvious'' designs were abandoned once real data broke
+their implicit assumptions. Where that happened, this document says so.
+
+\section{Phase 1: Footprint Extrusion}
+\label{sec:extrusion}
+
+\subsection{Height resolution}
+
+Every source footprint $b$ carries at most an OpenStreetMap height tag $h_{\text{osm}}(b)$ and
+a storey count $\ell(b)$; both are frequently absent (in the raw data, 73\% of footprints have
+no usable height tag at all). A building's resolved height $h(b)$ is a coalesce over three
+tiers, from most to least trusted:
+
+\begin{equation}
+  h(b) = \begin{cases}
+    h_{\text{osm}}(b) & \text{if } h_{\text{osm}}(b) > 0 \\[2pt]
+    \ell(b) \cdot H_{\text{storey}} & \text{if } h_{\text{osm}}(b) = 0 \text{ and } \ell(b) > 0 \\[2pt]
+    H_{\text{default}} & \text{otherwise}
+  \end{cases}
+  \label{eq:height-coalesce}
+\end{equation}
+
+with $H_{\text{storey}} = H_{\text{default}} = 3.2$\,m. Each building is tagged with which
+tier resolved it (\code{osm}, \code{levels}, or \code{estimated\_default}), purely for later
+traceability --- a diagnostic pass confirmed the zero-height buildings are scattered
+island-wide with no geographic clustering, ruling out a systematic data gap in one area, and
+the resulting tier tags let any later consumer filter out the least-trusted geometry if
+needed.
+
+\subsection{Extrusion into a solid}
+
+A footprint is one or more polygon parts (a building split across disjoint parts becomes a
+\emph{CompositeSolid} instead of a single \emph{Solid}); each part is an exterior ring
+$r_0$ plus zero or more interior hole rings $r_1, \dots, r_k$. Given a resolved height $h(b)$
+and a flat base elevation $z_0$ (taken as $0$ at this phase; Phase 4 generalises this to a
+non-flat, terrain-following base), extrusion to a closed box is purely geometric:
+
+\begin{algorithm}[H]
+\caption{Footprint $\to$ LoD1 solid}
+\label{alg:extrude}
+\begin{algorithmic}[1]
+\Function{ExtrudeSolid}{$\{r_0,\dots,r_k\}$, $z_0$, $z_1$}
+  \State $F \gets \emptyset$ \Comment{set of faces, each a list of vertex indices}
+  \For{each ring $r_i$}
+    \State $B_i \gets$ vertices of $r_i$ at $z_0$
+    \State $T_i \gets$ vertices of $r_i$ at $z_1$
+  \EndFor
+  \State $F \gets F \cup \{\,\mathrm{reverse}(B_0), \dots, \mathrm{reverse}(B_k)\,\}$
+    \Comment{bottom cap, wound opposite the top so its normal points down}
+  \State $F \gets F \cup \{\,T_0, \dots, T_k\,\}$ \Comment{top cap}
+  \For{each ring $r_i$}
+    \For{each edge $(p_j, p_{j+1})$ of $r_i$, cyclically}
+      \State $F \gets F \cup \{\,[\,(p_j,z_0),\,(p_{j+1},z_0),\,(p_{j+1},z_1),\,(p_j,z_1)\,]\,\}$
+        \Comment{one wall quad per edge}
+    \EndFor
+  \EndFor
+  \State \Return closed solid with boundary $F$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+The bottom cap is wound in reverse relative to the top cap purely so that, under a consistent
+right-hand winding-to-normal convention, the bottom face's normal points downward and the top
+face's upward --- both faces then correctly point outward from the solid.
+
+\subsection{Vertex pooling and quantization}
+
+Adjacent buildings, and a building's own top/bottom/wall faces, frequently reference
+geometrically identical points (a wall's bottom-left corner is the same point as the bottom
+cap's corresponding corner). Rather than storing each occurrence independently, every vertex
+insertion is routed through a pool that deduplicates by rounded coordinate:
+
+\begin{equation}
+  \mathrm{key}(x,y,z) = \big(\,\mathrm{round}(x,p),\ \mathrm{round}(y,p),\ \mathrm{round}(z,p)\,\big), \qquad p = 3 \text{ decimal places}
+\end{equation}
+
+with the pool holding a hash map from key to index; a repeated key returns the existing index,
+a new key is appended and assigned the next index. This deduplication happens \emph{globally}
+across the whole file being built, not per building --- a detail that matters again in
+Section~\ref{sec:backfill-geometry}. Once the full vertex list is known, it is quantized to
+integer coordinates for the CityJSON output:
+
+\begin{equation}
+  q(x) = \mathrm{round}\!\left(\frac{x - x_{\min}}{s}\right), \qquad s = 10^{-3}
+  \label{eq:quantize}
+\end{equation}
+
+i.e.\ millimetre-precision integers relative to the dataset's own minimum corner, which
+CityJSON's \texttt{transform} object records so any reader can dequantize
+($x = q(x)\cdot s + x_{\min}$) exactly.
+
+\section{Phase 1.5: Authoritative Height Backfill}
+\label{sec:backfill}
+
+\subsection{Nearest-centroid spatial join}
+
+A separate, independently surveyed building register provides government-measured heights for
+most, but not all, buildings, indexed only by an approximate point location, not by matching
+footprint geometry. Matching a footprint $b$ to a register record is a nearest-neighbour
+query: compute each footprint's centroid $c(b)$, build a $k$-d tree over every register
+record's location, and for each $b$ find
+
+\begin{equation}
+  r^*(b) = \operatorname*{argmin}_{r \in \mathcal{R}} \lVert c(b) - \mathrm{loc}(r) \rVert
+\end{equation}
+
+accepting the match only if $\lVert c(b) - \mathrm{loc}(r^*(b)) \rVert \le \tau$ for a fixed
+tolerance $\tau = 40$\,m; otherwise $b$ keeps whatever height Equation~\ref{eq:height-coalesce}
+already gave it. In practice this matches 93\% of buildings, dropping the
+\code{estimated\_default} tier from 73\% of the dataset to 6\%. Register records are
+deduplicated by their own stable identifier before the tree is built, since the underlying
+tile scheme yields the same physical building many times over at different levels of detail.
+
+\subsection{Keeping geometry consistent with a height correction}
+\label{sec:backfill-geometry}
+
+Overwriting $h(b)$ alone is insufficient: the solid built in Section~\ref{sec:extrusion} has
+its top face's vertices already placed at the \emph{old} height. An early version of this
+phase did exactly that --- updated the attribute, left the geometry untouched --- and the
+resulting mismatch was only caught by a user visually inspecting the rendered model and
+noticing a well-known 58\,m building rendered flat at the 3.2\,m default. A systematic check
+afterwards found the geometry silently disagreed with the (correct) attribute for effectively
+every corrected building.
+
+The naive fix --- re-run Algorithm~\ref{alg:extrude} from scratch for every corrected building
+--- is correct but wasteful: it allocates a full new set of vertices even though, in the
+common case, a building's own top-face and wall-top vertices are not shared with anything
+else and can simply be \emph{moved}. But the deduplicating pool from
+Section~\ref{sec:extrusion} operates globally, not per building, so two structurally attached
+buildings (e.g.\ a row of shophouses sharing a party wall) that happen to have landed on the
+same default height can genuinely share a vertex at their common top corner. Moving such a
+vertex in place would silently drag a neighbour's roof along with it.
+
+The correct approach computes, once, a global reference count for every vertex index (how many
+times it is used across every solid in the file), then treats each corrected building's own
+top vertices individually:
+
+\begin{algorithm}[H]
+\caption{Relocate a building's roof to a new height, without corrupting shared geometry}
+\label{alg:reheight}
+\begin{algorithmic}[1]
+\Function{RegenerateHeight}{$b$, $h_{\text{new}}$, $\mathrm{refcount}[\cdot]$}
+  \State $L \gets$ multiset of vertex indices referenced anywhere in $b$'s own solid
+  \State $V_{\text{top}} \gets \{\, v \in L : z(v) \neq z_0 \,\}$ \Comment{top-face \& wall-top vertices}
+  \State $\mathrm{map} \gets \{\, v \mapsto v : v \in L \,\}$ \Comment{identity by default}
+  \For{$v \in V_{\text{top}}$}
+    \If{$\mathrm{refcount}[v] > \mathrm{count}(L, v)$} \Comment{used outside $b$ too}
+      \State $v' \gets$ new pool entry at $(x(v), y(v), h_{\text{new}})$
+      \State $\mathrm{map}[v] \gets v'$
+      \State $\mathrm{refcount}[v] \gets \mathrm{refcount}[v] - \mathrm{count}(L, v)$
+    \Else \Comment{exclusively $b$'s own vertex}
+      \State mutate the pool entry for $v$ in place: $z(v) \gets h_{\text{new}}$
+    \EndIf
+  \EndFor
+  \State rewrite $b$'s solid boundary by applying $\mathrm{map}$ to every referenced index
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+The comparison $\mathrm{refcount}[v] > \mathrm{count}(L, v)$ --- global usage count strictly
+exceeding \emph{this building's own} usage count of the same vertex --- is what distinguishes
+``shared with someone else'' from ``referenced several times within my own solid,'' which the
+naive check $\mathrm{refcount}[v] > 1$ cannot: a building's own top ring and its adjoining wall
+quads legitimately reference the same corner vertex multiple times purely as an artefact of
+how Algorithm~\ref{alg:extrude} lists faces. Run against a real 118{,}782-building dataset,
+this reduced the redundant vertex growth from what a full re-extrusion would have cost
+(roughly a 100\% increase) to 3.6\%, while a direct audit confirmed zero unrelated buildings
+had their geometry altered.
+
+One further correctness detail: the decision of \emph{whether} a building needs regeneration
+at all must be made by comparing the candidate new height against the building's
+\emph{current geometry}, not its current attribute --- if this phase is ever re-run against an
+already-corrected file (for instance because the register itself was updated), comparing
+against the attribute would find ``no change'' for every already-corrected building and skip
+exactly the geometry that most needs re-checking.
+
+\subsection{A more ambitious, later-abandoned approach: full mesh replacement}
+
+Height correction fixes buildings whose \emph{footprint} is right but whose \emph{height} was
+wrong. It cannot fix buildings whose real form is fundamentally not a uniform-height prism ---
+a stadium's swept roof, a building's outline formed by unioning several offset stacked blocks
+into one OSM polygon. For a short list of such landmark buildings, a separate effort attempted
+to replace their LoD1 box with real surveyed mesh geometry extracted from a government 3D
+tile service, transforming each mesh from its native East-North-Up frame (centred at a
+per-tile reference point) through Earth-centred Earth-fixed coordinates into the pipeline's
+own projected system.
+
+This was built and technically worked --- coordinate accuracy was independently verified by
+recovering a known building's exact height on the first attempt --- but was reverted after
+visual review placed the replacement meshes \emph{next to their real neighbours} rather than
+in isolation: several replacements were offset from their OneMap reference point by 70--300\,m,
+and one showed two adjacent landmark meshes overlapping each other. The root cause was
+determined to be a \emph{scope} mismatch, not a coordinate error: the OSM footprint being
+replaced sometimes spans a whole podium-and-towers complex while the corresponding surveyed
+mesh covers only the roof structure, or vice versa. Because an isolated, no-context render had
+been used as the only validation step, this mismatch was invisible until the final review ---
+a lesson recorded and carried forward into every later phase, all of which validate results in
+their real surrounding context rather than in isolation wherever practical.
+
+\section{Phase 2: Domain Cutout}
+\label{sec:cutout}
+
+Given an arbitrary polygon domain $D$ specified by a user (in practice, drawn as a boundary on
+a map), the cutout operation keeps only buildings fully enclosed by $D$:
+
+\begin{equation}
+  \mathrm{keep}(b) \iff \mathrm{footprint}(b) \subseteq D
+\end{equation}
+
+with no partial clipping: a building straddling the boundary is dropped in its entirety rather
+than being cut in half, since a half-building is not a meaningful CFD obstacle. This requires
+an exact geometric containment test, not merely a bounding-box overlap test, since a domain
+boundary is rarely axis-aligned.
+
+The reverse of the vertex-pooling step in Section~\ref{sec:extrusion} is needed here: once the
+kept building set $K$ is known, the retained CityJSON must reference a \emph{compacted}
+vertex array (indices $0, \dots, |V_K|-1$) rather than sparse indices into the original file's
+full array.
+
+\begin{algorithm}[H]
+\caption{Compact a subset of a CityJSON's geometry to a dense vertex range}
+\begin{algorithmic}[1]
+\Function{CompactVertices}{$K$}
+  \State $U \gets \emptyset$ \Comment{referenced index set}
+  \For{$b \in K$}
+    \State $U \gets U \cup \{\text{every vertex index appearing in } b\text{'s boundary}\}$
+  \EndFor
+  \State $U_{\text{sorted}} \gets \mathrm{sort}(U)$
+  \State $\mathrm{map} \gets \{\, U_{\text{sorted}}[i] \mapsto i : i = 0,\dots,|U|-1 \,\}$
+  \State new vertex array $\gets [\, V[u] : u \in U_{\text{sorted}} \,]$
+  \State rewrite every $b \in K$'s boundary by applying $\mathrm{map}$
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+This same compaction routine is reused, unmodified, by the editing operations in
+Section~\ref{sec:editing} and by the height-regeneration step in
+Section~\ref{sec:backfill-geometry}'s remap --- it is a general operation on any nested
+boundary structure, independent of what the geometry represents.
+
+For interactive use at full-dataset scale, a naive implementation of $\mathrm{keep}(b)$ ---
+reconstructing every building's footprint polygon from its solid geometry on every query ---
+is far too slow (measured at tens of seconds against a 118{,}782-building file for a single
+query). The mitigation is a one-time spatial index: an R-tree over every footprint, built once
+when the dataset is loaded, so a containment query only reconstructs the geometry of buildings
+whose bounding box could plausibly intersect $D$ in the first place, rather than every
+building in the file.
+
+\section{Phase 3: Terrain Overlay}
+\label{sec:terrain}
+
+\subsection{Elevation surface from sparse contours}
+
+The source elevation data is a sparse point cloud sampled along 20\,m-interval contour lines,
+not a regular grid. A digital terrain model (DTM) --- a regular grid of elevations
+$Z[i,j]$ --- is built by scattered-data interpolation: for output grid coordinates $(x,y)$,
+
+\begin{equation}
+  Z(x,y) = \begin{cases}
+    \mathrm{LinearInterp}(x,y) & \text{if } (x,y) \text{ is inside the input points' convex hull} \\
+    \mathrm{NearestInterp}(x,y) & \text{otherwise}
+  \end{cases}
+\end{equation}
+
+using a Delaunay triangulation of the input point cloud for the linear case (each output cell
+falls inside some input triangle and is interpolated from that triangle's three corner
+elevations) and nearest-neighbour fill outside the hull, where linear interpolation is
+undefined. A single global distance-to-nearest-sample threshold was tried, to suppress the
+long, geometrically implausible ``flat wedge'' triangles that a Delaunay triangulation
+produces when bridging a real coverage gap (for instance, mainland to a distant offshore
+island) --- but this was abandoned: a single threshold cannot distinguish a genuine data gap
+from Singapore's ordinary sparse contour spacing on flat terrain, and in testing it discarded
+90\% of the entire island's grid as ``untrustworthy.'' Properly solving this would require a
+real coastline mask or a concave-hull (alpha-shape) approach; the coarse interpolation is used
+as-is, which is an acceptable approximation given this pipeline's town-scale accuracy
+requirement.
+
+Given a built DTM, elevation at an arbitrary point is a standard bilinear lookup: map
+$(x,y)$ to fractional grid coordinates $(c,r)$ via the grid's affine transform, then
+
+\begin{equation}
+  Z(c,r) = (1-t_c)(1-t_r)\,Z_{00} + t_c(1-t_r)\,Z_{10} + (1-t_c)t_r\,Z_{01} + t_c t_r\,Z_{11}
+\end{equation}
+
+where $Z_{00},\dots,Z_{11}$ are the four grid cells surrounding $(c,r)$ and $t_c, t_r$ are the
+fractional offsets within that cell.
+
+\subsection{The seam problem, and why a per-vertex offset is not the fix}
+
+Draping buildings onto a terrain surface independently of the terrain's own triangulation ---
+sampling $Z$ at each building's centroid and shifting the whole prism by that one offset ---
+is simple but wrong at any location where elevation varies meaningfully across a single
+footprint: a diagnostic pass found 8.9\% of buildings in a real test domain have over 1\,m of
+elevation variation across their own footprint, concentrated at terrain escarpments. Buildings
+in such areas visibly float above or sink into the terrain, with a real gap at the
+building/ground boundary. Sampling elevation at every footprint vertex individually (instead
+of once at the centroid) reduces, but does not eliminate, the gap: the terrain surface and the
+building's raked base are still two independently triangulated surfaces that merely pass near
+each other, not surfaces that share vertices.
+
+\subsection{Constrained triangulation}
+
+The seam is closed \emph{by construction}, not by numerical proximity, by inserting every
+building footprint boundary as a hard constraint directly into the terrain's own triangulation,
+rather than triangulating the terrain independently and draping buildings onto the result
+afterwards. This uses a planar straight-line graph (PSLG) --- a set of vertices, required
+edges between some of them, and hole regions that must not be triangulated:
+
+\begin{itemize}
+  \item A background grid of terrain sample points fills the domain, excluding points inside
+    (or within a small collar of) any building footprint.
+  \item The \emph{union} of all footprints' boundaries --- not each building's boundary
+    independently --- is inserted as required edges. Using the union rather than per-building
+    boundaries means two touching or overlapping buildings contribute one shared boundary
+    segment rather than two coincident ones, which avoids producing degenerate sliver
+    triangles at their shared wall.
+  \item Each footprint's interior holes (courtyards) are \emph{not} punched out of the terrain
+    --- the ground continues to exist underneath a courtyard, so only the annulus between a
+    footprint's outer and inner ring is treated as excluded, not the courtyard interior itself.
+  \item The overall domain boundary is inserted as required edges too: omitting it was found,
+    empirically, to make the triangulator silently ignore most of the background grid instead
+    of raising an error, because it could no longer determine which region was ``inside.''
+\end{itemize}
+
+A constrained Delaunay triangulation of this PSLG then produces a terrain mesh whose vertex set
+already includes a vertex at every point where a footprint touches the ground.
+Building base vertices are then generated by evaluating the \emph{same} elevation function at
+the \emph{same} $(x,y)$ coordinates that the terrain triangulation used at that boundary, so
+they quantize (Equation~\ref{eq:quantize}) to the identical vertex-pool key and collapse to a
+single shared index automatically --- the seam closes as a direct consequence of both surfaces
+sampling elevation identically at identical points, not as an approximation. This was verified
+numerically on real data (not merely asserted): every building base vertex on a footprint's
+exposed boundary was confirmed to share the exact pool index of the corresponding terrain
+vertex, with zero exceptions once vertices on \emph{hidden} shared walls between touching
+buildings (which are legitimately absent from the terrain, since no ground is exposed there)
+were correctly excluded from the check.
+
+One numerical pitfall is worth recording: the triangulation library used silently produced
+zero triangles when handed vertices at Singapore's real absolute coordinate magnitude
+(tens of thousands of metres from the coordinate origin), for reasons of internal
+floating-point precision handling, and produced a correct result once the same input was
+translated to sit near the origin first. The fix is a simple shift-then-triangulate-then-shift-back:
+
+\begin{equation}
+  V' = V - \min(V), \qquad \text{triangulate}(V', E, H), \qquad V'_{\text{out}} = V_{\text{out}} + \min(V)
+\end{equation}
+
+applied uniformly to every vertex and hole seed point passed to the triangulator.
+
+\subsection{Draped extrusion}
+
+Once a footprint's base elevation is a function of position rather than a single scalar,
+Algorithm~\ref{alg:extrude} needs one modification: the flat base $z_0$ becomes a per-vertex
+function $z_0(x,y) = Z(x,y)$ (raked to follow the ground), while the roof remains a single
+flat plane,
+
+\begin{equation}
+  z_1 = \max_{(x,y) \in \text{footprint boundary}} Z(x,y) \; + \; h(b)
+\end{equation}
+
+taking the \emph{maximum} base elevation across the footprint, not an average, so that the
+roof never dips below any point of a raked base on sloped terrain (which would invert a wall
+face). Since the base is no longer planar, each wall quad is no longer guaranteed to be a
+planar face and is triangulated into two triangles rather than left as a quad.
+
+Two usage regimes exist for this overlay: a coarse, whole-island pass appropriate at
+118{,}782-building scale (using the simpler centroid-drape from
+Section~\ref{sec:terrain}'s first subsection, accepting its known limitations, since a full
+constrained triangulation is not needed at whole-island scale) and the constrained,
+seam-exact version described above, used only at the scale of a single user-specified CFD
+domain (hundreds to low thousands of buildings), where the seam quality directly matters for
+mesh generation.
+
+\section{Phase 4: Editing}
+\label{sec:editing}
+
+Adding a building to an existing dataset reuses Algorithm~\ref{alg:extrude} directly, with the
+new building's ground elevation resolved through the same three-tier priority used throughout
+the pipeline: an explicit flat elevation if the caller supplies one, otherwise the terrain
+elevation function if one is available for the dataset (draped per vertex, exactly as in
+Section~\ref{sec:terrain}), otherwise a flat $z=0$ fallback. Because the target file is already
+finalized (its vertex array already quantized against a fixed \code{transform}), new vertices
+are appended directly in quantized form rather than re-running the deduplicating pool used at
+initial construction --- correct because an edit adds a small number of vertices relative to
+the whole file, so the cost of the rare duplicate is negligible next to the cost of rebuilding
+a hash index over a multi-million-vertex file for every single edit.
+
+Removing a building is the reverse: delete its CityObject entry. Whether to run the vertex
+compaction from Section~\ref{sec:cutout} afterwards is a genuine trade-off, not automatic: a
+single ad-hoc removal leaves a handful of now-unreferenced vertices in the pool, which is
+harmless (every downstream tool tolerates unused vertices) and far cheaper than an $O(|V|)$
+compaction pass; compaction is offered as an explicit, opt-in operation for the case where many
+edits have accumulated and file size matters.
+
+\section{Phase 5: Watertight Solid Export}
+\label{sec:solid}
+
+The final phase fuses a domain's buildings and terrain --- so far two conceptually separate
+kinds of CityJSON object, a set of closed solids and one open terrain sheet --- into a single
+watertight solid appropriate for CFD volume meshing, then simplifies it to a resolution that
+matches the downstream mesh's own resolution.
+
+\subsection{Why an exact boolean union does not work}
+
+The most direct approach --- compute the exact constructive-solid-geometry (CSG) union of
+every building solid with a solidified terrain slab --- was tried first and abandoned. Batching
+the union of roughly 2600 buildings against the terrain in a single operation catastrophically
+fragmented the result (dozens of disconnected pieces, with parts of the terrain itself missing
+from the output). Performing the unions one at a time instead of batching recovered most of
+the geometry but still left hundreds of leftover fragments, traced to buildings whose footprint
+has near-duplicate or collinear vertices --- an OSM data-quality artefact that also causes
+exactly the kind of degenerate input that exact CSG solvers are known to handle poorly at the
+coincident seams Section~\ref{sec:terrain} deliberately creates. An exact boolean solver is
+simply not robust against this much real-world data irregularity at this object count.
+
+\subsection{Implicit resampling instead of an exact union}
+
+The terrain, as noted, is an open sheet, not a volume; it is first \emph{solidified} by
+extruding it downward by a fixed depth to produce a genuine slab, and each building's base is
+deliberately \emph{plunged} downward through that slab (rather than merely touching its top
+surface) to guarantee real volumetric overlap instead of a knife-edge surface coincidence at
+exactly the seam vertices Section~\ref{sec:terrain} worked to make numerically identical.
+
+Everything is then simply \emph{joined} into one mesh --- with no boolean operation computed at
+all, overlaps, self-intersections and all --- and passed through a \emph{voxel remeshing} step:
+the input is resampled onto a regular 3D grid at a fixed resolution (an inside/outside
+classification per grid cell, in the spirit of an implicit-surface or signed-distance
+representation), and a single new, clean, self-consistent surface is re-extracted from that
+grid. This step does not care whether its input is self-intersecting, overlapping, or
+fragmented into hundreds of disconnected pieces, because it never attempts to compute an exact
+topological union of the input faces at all --- it only classifies space. On a real test
+domain, this produced a single connected body from input that would have defeated an exact
+boolean solver.
+
+The voxel resolution is chosen to match the resolution the downstream CFD mesh itself will
+use; resampling geometry to a coarser triangle size than the mesh's own cell size discards no
+real fidelity, since the CFD mesher would discard finer detail anyway. A voxel size finer than
+necessary is not a free quality upgrade, either --- face count scales with surface area
+divided by the voxel size squared, uniformly across the whole surface including large flat
+walls and roofs that gain no real detail from finer resampling, so an unnecessarily fine voxel
+size blows up downstream face count for no benefit.
+
+A small number of degenerate boundary slivers (order tens of fragments, a handful of faces
+each, sitting exactly on the domain's outer edge) remain after remeshing, a resampling
+precision artefact rather than lost geometry; these are identified by splitting the result into
+its disconnected loose parts and discarding every part below a small face-count threshold,
+keeping exactly one surviving main body.
+
+\subsection{Simplification by quadric error metric edge collapse}
+
+Voxel remeshing samples uniformly by surface area, so a flat wall, roof, or terrain patch ends
+up just as densely tessellated as any other region --- genuinely wasteful, since no new shape
+information exists there. The mesh is simplified afterwards using \emph{quadric error metric}
+(QEM) edge collapse, a standard mesh-simplification algorithm: every vertex $v$ accumulates a
+symmetric $4\times4$ matrix $Q_v$ summing, over every face plane $p$ incident to $v$ (with unit
+normal $n_p$ and offset $d_p$, i.e.\ plane equation $n_p^\top x + d_p = 0$), the outer product
+
+\begin{equation}
+  Q_v = \sum_{p \ni v} \begin{bmatrix} n_p n_p^\top & n_p d_p \\ d_p n_p^\top & d_p^2 \end{bmatrix}
+\end{equation}
+
+so that for any point $\bar{x}$ (in homogeneous coordinates), $\bar{x}^\top Q_v \bar{x}$ is
+exactly the sum of squared distances from $\bar{x}$ to every plane incident to $v$. Collapsing
+an edge $(v_1, v_2)$ to a single new point $\bar{v}$ costs
+
+\begin{equation}
+  \mathrm{cost}(v_1, v_2 \to \bar{v}) = \bar{v}^\top (Q_{v_1} + Q_{v_2})\, \bar{v}
+\end{equation}
+
+and the algorithm greedily collapses the globally cheapest available edge, recomputing the
+cost of newly-adjacent edges after each collapse, until a target face count is reached. This
+is simplification, not the earlier deep-extrude-and-union step: it is applied once, after the
+mesh is already a single clean watertight-or-near-watertight body, purely to reduce
+unnecessary triangle density.
+
+A visually more targeted-sounding alternative --- collapsing only near-coplanar faces within an
+angle threshold, which in principle should specifically simplify flat regions without touching
+curved or detailed ones --- was tried and abandoned: on real data at this face count it did not
+terminate in a reasonable time, a known characteristic of that class of algorithm on large
+meshes, whereas quadric edge collapse simplified the same mesh by an order of magnitude in
+single-digit seconds. Quadric collapse simplifies more uniformly rather than specifically
+sparing flat regions, but the resulting volume was independently confirmed to match the
+pre-simplification volume to within a fraction of a percent despite a substantial face-count
+reduction, which was judged an acceptable trade for this pipeline's LoD1-box source geometry.
+
+Edge-collapse simplification of this kind has an inherent sequential character --- collapsing
+one edge changes the cost of every edge adjacent to the collapsed region, so successive
+collapse decisions are not independent of one another, which is the reason this class of
+algorithm resists straightforward parallelization. A separate, embarrassingly-parallel
+simplification strategy (vertex clustering: merging every vertex that falls in the same cell
+of a coarse spatial grid) exists and was considered, but was ruled out for this pipeline
+specifically because it does not preserve the mesh's manifold structure, which would work
+directly against the watertightness goal of this whole phase.
+
+\subsection{Verifying and, if necessary, repairing watertightness}
+
+A mesh is watertight when it is simultaneously edge-manifold (every edge borders exactly two
+faces), vertex-manifold (the faces around every vertex form a single connected fan), and free
+of self-intersections. Despite the seam-matching construction in Section~\ref{sec:terrain} and
+the implicit resampling in this section, the result is not guaranteed to satisfy this exactly:
+watertightness is verified directly rather than assumed, and only if that check fails is a
+general-purpose mesh repair (closing residual small holes, one class of correctable
+non-manifold configuration) invoked --- an expensive operation whose cost scales with input
+face count, skipped whenever it would be redundant. In practice, simplification is run
+\emph{before} this check, both because it removes genuine near-degenerate artefacts that make
+the check more likely to pass on its own, and because deferring the (potentially necessary)
+repair step until after the mesh is already an order of magnitude smaller keeps that step's
+memory use within what commodity hardware can handle --- attempting repair on the
+full-resolution pre-simplification mesh directly was measured to be both far slower and to
+approach the memory ceiling of a typical single workstation, confirming this ordering is a
+reliability requirement of the pipeline, not merely a speed convenience.
+
+\section{Summary}
+
+Table~\ref{tab:phases} summarises each phase's core operation and its key correctness
+guarantee.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}p{2.6cm}p{5.6cm}p{6cm}@{}}
+\toprule
+\textbf{Phase} & \textbf{Core operation} & \textbf{Correctness guarantee} \\
+\midrule
+1. Extrusion & Footprint + scalar height $\to$ LoD1 solid & Consistent winding; deduplicated, quantized vertices \\
+1.5 Backfill & Nearest-centroid height correction & Geometry kept consistent with the corrected attribute, without disturbing unrelated shared vertices \\
+2. Cutout & Whole-building domain filter & Exact containment test; compacted vertex range \\
+3. Terrain & Constrained triangulation + draped extrusion & Building/terrain seam closes by shared vertex index, not proximity \\
+4. Editing & Append or remove one building & Elevation resolved consistently with the dataset's own terrain model \\
+5. Solid export & Voxel resample + QEM simplify + verify/repair & Single watertight, orientable solid at target mesh resolution \\
+\bottomrule
+\end{tabular}
+\caption{Phase summary.}
+\label{tab:phases}
+\end{table}
+
+Across all six phases, the recurring failure mode was the same: an approach that looked correct
+in isolation --- a per-vertex height offset, an isolated render of one replacement mesh, an
+exact boolean union, a global-only reference count --- broke specifically at the point where
+one piece of geometry meets another. Every fix in this pipeline that survived contact with real
+data replaced a locally-plausible approximation with a construction that makes the relevant
+quantity (a seam, a shared vertex, a watertight boundary) exactly true by how the geometry is
+built, rather than approximately true by tuning a tolerance.
+
+\end{document}
