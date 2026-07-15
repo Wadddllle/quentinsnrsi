@@ -8,11 +8,28 @@ shapely/pyproj/pymeshfix imports here, plain stdlib + bpy only. Invoke via:
       --input data/cbd_town_test.obj \\
       --deep-extrude 30 \\
       --voxel-size 2.0 \\
-      --decimate-ratio 0.15 \\
       --output data/cbd_town_test.stl
 
 Then run `sbg/blender/repair_stl.py` (plain .venv Python, no Blender) on the
-result to close any last tiny defect and confirm watertightness.
+result -- it now does the decimation too (via `fast_simplification`, see its
+own module docstring), not just verify+repair; this script's job ends at a
+clean, debris-free, full-resolution mesh.
+
+Decimation used to happen here too (Blender's own DECIMATE/COLLAPSE
+modifier, see the historical writeup further down for why COLLAPSE was
+chosen over Planar/DISSOLVE) but moved to repair_stl.py's venv-side
+`fast_simplification.simplify()` call instead -- measured directly on a real
+~3.46M-polygon mesh from this exact pipeline: COLLAPSE took 142.2-155.2s
+here in Blender vs. 16.5s venv-side (~9-10x faster), with better volume
+preservation (0.0003% delta vs. the 0.001% bar COLLAPSE was already held
+to) and pymeshfix repairing its output faster too. COLLAPSE is also
+confirmed genuinely single-threaded, and fast_simplification isn't
+importable inside Blender's own bundled Python interpreter (it's a project
+.venv package), so this had to move to a different process entirely rather
+than just swap which modifier runs. The COLLAPSE-vs-Planar comparison below
+is kept as real, still-relevant history (informed choosing a fast quadric
+algorithm at all, which fast_simplification also is), not a description of
+what this script currently does.
 
 Pipeline (rewritten after the first design -- see below for why):
   1. Import the OBJ. cjio's obj export gives one named `o` group per
@@ -85,33 +102,42 @@ own edge -- a remesh precision artifact, not lost buildings) alongside the
 one real fused body; `bpy.ops.mesh.separate(type='LOOSE')` splits those out
 so they can be dropped by face-count threshold before ever leaving Blender.
 
-Decimate (--decimate-ratio, 0-1) runs last, after debris is dropped. Voxel
-remesh samples uniformly by surface area, so a flat wall/roof/terrain patch
-gets just as densely tessellated as anything else -- genuinely wasteful,
+(Historical -- this script no longer decimates; see the note near the top.)
+Decimate used to run last here, after debris is dropped. Voxel remesh
+samples uniformly by surface area, so a flat wall/roof/terrain patch gets
+just as densely tessellated as anything else -- genuinely wasteful,
 confirmed visually (wireframe of a flat region at 2m voxel size renders
 solid from any moderately zoomed-out view) and numerically (5.26M faces for
-what's still just LOD1 boxes + a coarse terrain TIN).
+what's still just LOD1 boxes + a coarse terrain TIN). This oversampling
+problem, and the need to decimate before repair (see below), both still
+apply -- fast_simplification in repair_stl.py now does this job instead.
 
-Uses Decimate's COLLAPSE mode (quadric edge collapse, ratio-based) --
-deliberately NOT Planar/DISSOLVE mode (collapsing near-coplanar faces
-within an angle threshold), despite Planar sounding like the more targeted
-fit for "flat regions are oversampled." Tested Planar first and it hung:
-5+ minutes with no result on just 200K faces (confirmed via `top` it wasn't
-memory-bound, just algorithmically slow -- Blender's limited-dissolve is a
-known-slow operation on large meshes). COLLAPSE, a completely different and
-much better-optimized algorithm, decimated the same 241K-face mesh to 5-20%
-in under 9 seconds at any tested ratio. It simplifies more uniformly
-(doesn't specifically spare flat regions the way Planar would), but
-verified the shape cost is small: at ratio=0.15 on the 27-building test,
-volume after decimate+repair matched the pre-decimate volume to within
-0.001% (9,760,697.7 vs 9,760,826.9 m^3) despite a 5x face reduction.
+Blender's Decimate had used COLLAPSE mode (quadric edge collapse,
+ratio-based) -- deliberately NOT Planar/DISSOLVE mode (collapsing
+near-coplanar faces within an angle threshold), despite Planar sounding
+like the more targeted fit for "flat regions are oversampled." Tested
+Planar first and it hung: 5+ minutes with no result on just 200K faces
+(confirmed via `top` it wasn't memory-bound, just algorithmically slow --
+Blender's limited-dissolve is a known-slow operation on large meshes).
+COLLAPSE, a completely different and much better-optimized algorithm,
+decimated the same 241K-face mesh to 5-20% in under 9 seconds at any tested
+ratio. It simplifies more uniformly (doesn't specifically spare flat
+regions the way Planar would), but verified the shape cost is small: at
+ratio=0.15 on the 27-building test, volume after decimate+repair matched
+the pre-decimate volume to within 0.001% (9,760,697.7 vs 9,760,826.9 m^3)
+despite a 5x face reduction. fast_simplification is also a quadric
+edge-collapse algorithm (same family, different, faster implementation),
+so this same "why quadric edge collapse, not Planar/DISSOLVE" reasoning
+carried over directly to choosing it.
 
 This also matters for repair_stl.py's pymeshfix step: that library's memory
 use scales with face count (confirmed: 10.5M faces exceeded 8GB+ RAM and
 was still climbing when killed, before decimation existed in this
 pipeline). Decimating first, before any repair, keeps pymeshfix's input
 small -- confirmed the 40K-60K-face post-decimate mesh repairs in ~1.3s
-instead of risking OOM.
+instead of risking OOM. This constraint is exactly why repair_stl.py now
+decimates immediately before its own watertight-check/repair logic, in the
+same process, rather than as a separate earlier stage.
 """
 import bmesh
 import bpy
@@ -124,14 +150,14 @@ def parse_args(argv):
         argv = argv[argv.index("--") + 1:]
     else:
         argv = []
-    args = {"deep_extrude": 30.0, "voxel_size": 2.0, "debris_faces": 100, "decimate_ratio": 0.15}
+    args = {"deep_extrude": 30.0, "voxel_size": 2.0, "debris_faces": 100}
     i = 0
     while i < len(argv):
         key = argv[i].lstrip("-").replace("-", "_")
         if key in ("input", "output"):
             args[key] = argv[i + 1]
             i += 2
-        elif key in ("deep_extrude", "voxel_size", "decimate_ratio"):
+        elif key in ("deep_extrude", "voxel_size"):
             args[key] = float(argv[i + 1])
             i += 2
         elif key == "debris_faces":
@@ -281,18 +307,20 @@ def main():
     final = drop_debris(soup, args["debris_faces"])
     _lap("drop debris")
 
-    if args["decimate_ratio"] < 1.0:
-        pre_decimate_faces = len(final.data.polygons)
-        print(f"Decimating (COLLAPSE, ratio={args['decimate_ratio']})...", file=sys.stderr)
-        modd = final.modifiers.new(name="decimate", type="DECIMATE")
-        modd.decimate_type = "COLLAPSE"
-        modd.ratio = args["decimate_ratio"]
-        bpy.context.view_layer.objects.active = final
-        bpy.ops.object.modifier_apply(modifier=modd.name)
-        print(f"  decimated: {len(final.data.vertices)} vertices, {len(final.data.polygons)} faces", file=sys.stderr)
-        _lap(f"decimate COLLAPSE ({pre_decimate_faces} -> {len(final.data.polygons)} faces)")
-    else:
-        print("Skipping decimate (--decimate-ratio >= 1.0)", file=sys.stderr)
+    # Decimation used to happen right here (Blender's own DECIMATE/COLLAPSE
+    # modifier) but moved to a venv-side stage in repair_stl.py, which now
+    # calls fast_simplification.simplify() instead. Measured directly on a
+    # real ~3.46M-polygon mesh from this exact pipeline: COLLAPSE took
+    # 142.2-155.2s here in Blender vs. 16.5s for fast_simplification
+    # venv-side (~9-10x faster), with better volume preservation (0.0003%
+    # delta vs. the 0.001% bar COLLAPSE was already held to) and pymeshfix
+    # repairing its output faster too (14.1s vs 22.9-25.5s). COLLAPSE is
+    # also confirmed genuinely single-threaded (Blender developer/community
+    # consensus), and fast_simplification isn't importable inside Blender's
+    # own bundled Python interpreter (it's a project .venv package), so this
+    # had to move out of this script rather than just swap the modifier.
+    # This script now always exports right after debris-dropping --
+    # decimation is no longer this file's responsibility at all.
 
     print(f"Exporting {args['output']}...", file=sys.stderr)
     bpy.ops.object.select_all(action="DESELECT")

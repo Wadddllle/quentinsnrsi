@@ -117,6 +117,10 @@ def run_stl_pipeline(job, sbg_cm, ring, jobs_root, spatial_index=None):
     cjio_bin = Path(sys.executable).parent / "cjio"
     _run_subprocess(job, [str(cjio_bin), str(conforming_path), "export", "obj", str(obj_path)])
 
+    # export_stl.py no longer decimates (moved to fast_simplification below,
+    # ~9-10x faster than Blender's COLLAPSE on this scale -- see repair_stl.py's
+    # module docstring for the measured numbers) -- raw.stl here is the
+    # full-resolution, debris-dropped mesh straight out of voxel remesh.
     job.set_stage("blender_export")
     raw_stl_path = job_dir / "raw.stl"
     _run_subprocess(job, [
@@ -124,7 +128,7 @@ def run_stl_pipeline(job, sbg_cm, ring, jobs_root, spatial_index=None):
         "--input", str(obj_path), "--output", str(raw_stl_path),
     ])
 
-    job.set_stage("repair")
+    job.set_stage("decimate_and_repair")
     from sbg.blender.repair_stl import verify_and_repair
     final_stl_path = job_dir / "final.stl"
     mesh = verify_and_repair(str(raw_stl_path), str(final_stl_path), log_fn=job.log_line)
