@@ -23,6 +23,9 @@ import GUI from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import { Line2 } from 'three/examples/jsm/lines/Line2.js';
 import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+// Prototype: coarse whole-island terrain overlay, for visual orientation
+// only -- see sbg/topo/island_terrain.py and composables/islandTerrain.js.
+import { getIslandTerrain } from '../../composables/islandTerrain';
 
 export default {
 	name: 'ThreeJsViewer',
@@ -275,6 +278,11 @@ export default {
 			// wrong position until the ring itself happened to change again.
 			this.updateBoundaryRing();
 			this.updateHighlightFootprints();
+			// Re-shift too: same true-world -> local-frame conversion as the
+			// boundary/highlight overlays, and this citymodel change is the
+			// only thing that re-triggers it if the terrain finished loading
+			// before citymodel.transform was available.
+			this.updateIslandTerrain();
 
 			this.updateScene();
 
@@ -493,6 +501,15 @@ export default {
 		this.parser = null;
 		this.boundaryLine = null;
 		this.highlightLines = [];
+		// islandTerrainMesh: the built THREE.Mesh (kept out of data() like
+		// everything else here). terrainRaw: the raw fetched heightfield (a
+		// Float32Array wrapped in a plain object) -- also kept out of
+		// data(), same reasoning as `parser`: Vue 3's deep reactivity would
+		// wrap this in a Proxy, and re-reading millions of elements through
+		// a Proxy would be needless overhead even though this one is never
+		// postMessage'd.
+		this.islandTerrainMesh = null;
+		this.terrainRaw = null;
 
 	},
 	mounted() {
@@ -508,6 +525,15 @@ export default {
 		this.renderer.domElement.addEventListener( 'pointerdown', this.pointerDown, false );
 		this.renderer.domElement.addEventListener( 'pointermove', this.pointerMove, false );
 		this.renderer.domElement.addEventListener( 'pointerup', this.pointerUp, false );
+
+		const scope = this;
+		getIslandTerrain().then( data => {
+
+			scope.terrainRaw = data;
+			scope.updateIslandTerrain();
+			scope.updateScene();
+
+		} );
 
 	},
 	methods: {
@@ -991,7 +1017,7 @@ export default {
 			// coordinate unrelated to any real content), which never fired
 			// before Phase 1 started reloading citymodel after mount. See the
 			// project plan's lighting-bug writeup for how this was found.
-			const keep = new Set( [ this.ambientLight, this.spotLight, this.spotLight.target, this.boundaryLine, ...this.highlightLines ] );
+			const keep = new Set( [ this.ambientLight, this.spotLight, this.spotLight.target, this.boundaryLine, this.islandTerrainMesh, ...this.highlightLines ] );
 			for ( const child of [ ...this.scene.children ] ) {
 
 				if ( ! keep.has( child ) ) this.scene.remove( child );
@@ -1098,6 +1124,91 @@ export default {
 		getLods() {
 
 			return this.lods;
+
+		},
+		updateIslandTerrain() {
+
+			if ( this.islandTerrainMesh ) {
+
+				this.scene.remove( this.islandTerrainMesh );
+				this.islandTerrainMesh.geometry.dispose();
+				this.islandTerrainMesh.material.dispose();
+				this.islandTerrainMesh = null;
+
+			}
+
+			if ( ! this.terrainRaw ) return;
+
+			const { ncols, nrows, xmin, ymax, step, heights } = this.terrainRaw;
+			// Same true-world -> local-frame conversion as updateBoundaryRing --
+			// see its comment for why this subtraction is needed.
+			const [ tx, ty ] = this.citymodel?.transform?.translate || [ 0, 0 ];
+
+			const positions = new Float32Array( nrows * ncols * 3 );
+			for ( let r = 0; r < nrows; r ++ ) {
+
+				const y = ymax - r * step - ty;
+				for ( let c = 0; c < ncols; c ++ ) {
+
+					const idx = r * ncols + c;
+					const h = heights[ idx ];
+					positions[ idx * 3 ] = xmin + c * step - tx;
+					positions[ idx * 3 + 1 ] = y;
+					// NaN (masked/no-data) cells get a finite placeholder here --
+					// these vertices are never referenced by the index buffer
+					// below (see the valid-cell check), but a real NaN surviving
+					// into the position buffer would poison
+					// THREE.Box3.setFromBufferAttribute (it scans EVERY position,
+					// not just indexed ones), corrupting the mesh's bounding
+					// sphere/frustum culling for the whole object -- exactly the
+					// "silent corruption from an unguarded edge case" category
+					// this project has been bitten by before (see the 2D
+					// TypedArray under-allocation bug in OrthoWebGLView).
+					positions[ idx * 3 + 2 ] = Number.isNaN( h ) ? 0 : h;
+
+				}
+
+			}
+
+			// Upper bound is exact, not a guess: each of the (nrows-1)*(ncols-1)
+			// grid cells contributes at most 2 triangles / 6 indices, never
+			// more -- trim with subarray() after building, same
+			// provably-correct-bound pattern OrthoWebGLView's footprint buffers
+			// use (after that earlier bug taught the lesson the hard way).
+			const maxIndices = ( nrows - 1 ) * ( ncols - 1 ) * 6;
+			const indices = new Uint32Array( maxIndices );
+			let ptr = 0;
+			for ( let r = 0; r < nrows - 1; r ++ ) {
+
+				for ( let c = 0; c < ncols - 1; c ++ ) {
+
+					const i00 = r * ncols + c;
+					const i01 = i00 + 1;
+					const i10 = i00 + ncols;
+					const i11 = i10 + 1;
+
+					if ( Number.isNaN( heights[ i00 ] ) || Number.isNaN( heights[ i01 ] ) ||
+						Number.isNaN( heights[ i10 ] ) || Number.isNaN( heights[ i11 ] ) ) continue;
+
+					indices[ ptr ++ ] = i00; indices[ ptr ++ ] = i01; indices[ ptr ++ ] = i11;
+					indices[ ptr ++ ] = i00; indices[ ptr ++ ] = i11; indices[ ptr ++ ] = i10;
+
+				}
+
+			}
+
+			const geometry = new THREE.BufferGeometry();
+			geometry.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+			geometry.setIndex( new THREE.BufferAttribute( indices.subarray( 0, ptr ), 1 ) );
+			geometry.computeVertexNormals();
+
+			// Prototype coloring -- a plain muted green, not draped/textured.
+			// This overlay exists for visual orientation only (see
+			// island_terrain.py's module docstring), not to be mistaken for
+			// real terrain data at building-adjacent precision.
+			const material = new THREE.MeshStandardMaterial( { color: 0x9caf7c, side: THREE.DoubleSide } );
+			this.islandTerrainMesh = new THREE.Mesh( geometry, material );
+			this.scene.add( this.islandTerrainMesh );
 
 		}
 	}

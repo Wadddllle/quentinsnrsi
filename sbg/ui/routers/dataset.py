@@ -81,6 +81,19 @@ def get_footprints(bbox: str, request: Request):
     return ORJSONResponse({"buildings": [index.footprint_records[obj_id] for obj_id in ids]})
 
 
+@router.get("/terrain")
+def get_terrain(request: Request):
+    """Binary heightfield payload for the prototype whole-island 3D terrain
+    overlay -- see sbg.topo.island_terrain for the wire format. 404s if
+    data/dtm.tif wasn't available at startup, so the frontend can skip
+    terrain rendering cleanly instead of erroring.
+    """
+    body = request.app.state.island_terrain_body
+    if body is None:
+        raise HTTPException(404, "island terrain not available (data/dtm.tif missing at startup)")
+    return Response(content=body, media_type="application/octet-stream")
+
+
 @router.get("/stats")
 def get_stats(request: Request):
     cm = request.app.state.cm

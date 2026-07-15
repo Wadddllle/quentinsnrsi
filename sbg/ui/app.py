@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 
 from sbg.config import SBG_OUTPUT
 from sbg.io_cityjson import subset_cityjson
+from sbg.topo.island_terrain import build_masked_island_grid, pack_terrain_binary
 from sbg.ui.routers import cutout, dataset, onemap, pipeline
 from sbg.ui.spatial_index import build_index
 
@@ -62,6 +63,21 @@ def create_app(dev: bool = False, dataset_path=None) -> FastAPI:
         t1 = time.time()
         app.state.full_island_buildings_body = orjson.dumps(subset_cityjson(cm, index.ids))
         print(f"[sbg.ui] precomputed full-island buildings response ({time.time() - t1:.1f}s)")
+
+        # Prototype: coarse whole-island terrain for 3D visual context only
+        # (not part of the SBG dataset, not used by any CFD-facing pipeline).
+        # Precomputed once here for the same reason as the buildings body
+        # above -- a fixed, static payload, no reason to rebuild per request.
+        # Requires data/dtm.tif to already exist (`python -m sbg.topo.dtm`).
+        t2 = time.time()
+        try:
+            grid_z, transform = build_masked_island_grid(cm)
+            app.state.island_terrain_body = pack_terrain_binary(grid_z, transform)
+            print(f"[sbg.ui] precomputed island terrain mesh ({time.time() - t2:.1f}s, {len(app.state.island_terrain_body) / 1e6:.1f}MB)")
+        except FileNotFoundError:
+            app.state.island_terrain_body = None
+            print("[sbg.ui] data/dtm.tif not found, skipping island terrain (run `python -m sbg.topo.dtm` to enable)")
+
         yield
 
     app = FastAPI(title="SBG UI", lifespan=lifespan)
