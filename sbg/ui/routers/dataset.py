@@ -3,6 +3,7 @@ resolved via the in-memory spatial index (sbg.ui.spatial_index) so the
 browser never has to fetch the full 118k-building file. See project plan,
 Phase 6, Phase 1 build order item.
 """
+import orjson
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import ORJSONResponse
 
@@ -40,9 +41,19 @@ def get_buildings(bbox: str, request: Request):
     # bbox covering the entire dataset -- serve the response precomputed
     # once at startup (see app.py's lifespan) instead of paying
     # subset_cityjson()'s ~13s O(all boundary-index references) walk again
-    # on every request.
-    if len(ids) == len(index.ids):
-        return Response(content=request.app.state.full_island_buildings_body, media_type="application/json")
+    # on every request. Compared against active_count (not len(index.ids))
+    # because Phase 3's removed_ids filtering means the two only match when
+    # nothing's been removed yet -- see spatial_index.py. If a mutation has
+    # invalidated the cached body (app.py's routers/buildings.py sets it to
+    # None), recompute+recache here rather than eagerly on every removal --
+    # this endpoint is the only place that actually needs the full-island
+    # body, so it's the natural place to pay that cost lazily.
+    if len(ids) == index.active_count:
+        body = request.app.state.full_island_buildings_body
+        if body is None:
+            body = orjson.dumps(subset_cityjson(request.app.state.cm, ids))
+            request.app.state.full_island_buildings_body = body
+        return Response(content=body, media_type="application/json")
     if not ids:
         cm = request.app.state.cm
         return ORJSONResponse({

@@ -20,6 +20,7 @@ import JobProgressPanel from '../jobs/JobProgressPanel.vue';
 
 const props = defineProps({
 	footprints: { type: Array, default: () => [] },
+	removedIds: { type: Array, default: () => [] },
 });
 
 const emit = defineEmits(['committed', 'ring-changed', 'selection-changed', 'view-changed']);
@@ -291,6 +292,7 @@ defineExpose({
 				:ring="ring"
 				:kept-ids="keptIds"
 				:crossing-ids="crossingIds"
+				:removed-ids="removedIds"
 				@click="onCanvasClick"
 				@view-changed="onViewChanged"
 			/>

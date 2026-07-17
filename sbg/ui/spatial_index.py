@@ -58,10 +58,36 @@ class SpatialIndex:
         # was wired in to replace that scan.
         self.polygon_by_id = dict(zip(self.ids, self.polygons))
 
+        # Phase 3 (remove-building): shapely's STRtree has no
+        # removal/insertion API, and a full rebuild was measured at ~10.2s
+        # over 118,782 buildings -- too slow to pay per click. Since removal
+        # only ever needs the tree to STOP returning something (never to
+        # find something new), every query method below filters its raw
+        # tree results through this set instead of rebuilding. Not just an
+        # optimization: sbg.io_cityjson.subset_cityjson() does
+        # cm["CityObjects"][obj_id] with no existence check, so a stale
+        # removed id reaching it would KeyError -- this filtering is what
+        # guarantees that never happens.
+        #
+        # Adding a NEW footprint (Phase 4) can't use this same trick, since
+        # exclusion can't make something findable that was never in the
+        # tree -- flagged as a real Phase 4 extension point, not solved here.
+        self.removed_ids = set()
+
+    def mark_removed(self, obj_id):
+        self.removed_ids.add(obj_id)
+
+    def mark_restored(self, obj_id):
+        self.removed_ids.discard(obj_id)
+
+    @property
+    def active_count(self):
+        return len(self.ids) - len(self.removed_ids)
+
     def query_intersects_bbox(self, xmin, ymin, xmax, ymax):
         """Ids of buildings whose footprint intersects the bbox (for viewport-scoped fetches)."""
         idxs = self.tree.query(box(xmin, ymin, xmax, ymax), predicate="intersects")
-        return [self.ids[i] for i in idxs]
+        return [self.ids[i] for i in idxs if self.ids[i] not in self.removed_ids]
 
     def query_contained(self, domain_polygon):
         """Ids of buildings whose footprint is fully contained in domain_polygon
@@ -70,7 +96,7 @@ class SpatialIndex:
         extent check).
         """
         idxs = self.tree.query(domain_polygon, predicate="contains")
-        return [self.ids[i] for i in idxs]
+        return [self.ids[i] for i in idxs if self.ids[i] not in self.removed_ids]
 
     def query_intersects_not_contained(self, domain_polygon):
         """Ids of buildings that cross the domain boundary (intersect but
@@ -80,7 +106,7 @@ class SpatialIndex:
         """
         contained = set(self.query_contained(domain_polygon))
         idxs = self.tree.query(domain_polygon, predicate="intersects")
-        return [self.ids[i] for i in idxs if self.ids[i] not in contained]
+        return [self.ids[i] for i in idxs if self.ids[i] not in contained and self.ids[i] not in self.removed_ids]
 
 
 def build_index(cm):

@@ -3,6 +3,7 @@ import { ref, shallowRef, computed } from 'vue';
 import SbgViewer3D from './components/three/SbgViewer3D.vue';
 import BoundaryDrawTool from './components/plan2d/BoundaryDrawTool.vue';
 import LocationSearchBox from './components/LocationSearchBox.vue';
+import VersionHistoryPanel from './components/versioning/VersionHistoryPanel.vue';
 import { FULL_ISLAND_BBOX, getFullIslandCitymodel } from './composables/fullIslandData.js';
 
 // UX redesign (see project plan, Phase 6): single full-viewport 2D/3D toggle
@@ -60,6 +61,86 @@ const selectedObjid = ref(null);
 const boundaryRing = ref([]);
 const crossingIds = ref([]);
 
+// Phase 3 (remove-building): ids currently removed from the working
+// dataset -- NOT session-scoped (unlike sessionStatus below, this persists
+// across a Save Version, since the building really is gone from the file
+// either way; it only resets on a full Restore, which reloads the page --
+// see onRestored). Fed to both views the same way crossingIds already is:
+// OrthoWebGLView recolors matching triangles (cheap, existing per-vertex
+// color-attribute mechanism), ThreeJsViewer draws an outline overlay
+// (cheap, existing Line2 fat-line mechanism) -- neither actually hides the
+// removed building's real geometry, see SbgViewer3D.vue's own comment on
+// why that's a deliberate scope decision, not an oversight.
+const removedIds = ref([]);
+const sessionStatus = ref({ dirty: false, count: 0, summary: 'No changes', log: [] });
+const saveNote = ref('');
+const savingVersion = ref(false);
+const saveError = ref(null);
+const showHistory = ref(false);
+
+async function fetchSessionStatus() {
+	try {
+		const res = await fetch('/api/session/status');
+		if (res.ok) sessionStatus.value = await res.json();
+	} catch {
+		// non-fatal -- the badge just stays stale until the next successful poll
+	}
+}
+fetchSessionStatus();
+
+function onBuildingRemoved({ id, session }) {
+	if (!removedIds.value.includes(id)) removedIds.value = [...removedIds.value, id];
+	sessionStatus.value = session;
+	if (selectedObjid.value === id) selectedObjid.value = null;
+}
+
+async function undo() {
+	try {
+		const res = await fetch('/api/buildings/undo', { method: 'POST' });
+		const data = await res.json();
+		if (!res.ok) return;
+		sessionStatus.value = data.session;
+		if (data.undone?.op === 'remove') {
+			removedIds.value = removedIds.value.filter((id) => id !== data.undone.building_id);
+		}
+	} catch {
+		// leave state as-is -- user can retry
+	}
+}
+
+async function saveVersion() {
+	if (savingVersion.value) return;
+	savingVersion.value = true;
+	saveError.value = null;
+	try {
+		const res = await fetch('/api/versions/save', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ note: saveNote.value || null }),
+		});
+		const data = await res.json();
+		if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+		saveNote.value = '';
+		await fetchSessionStatus();
+	} catch (err) {
+		saveError.value = err.message;
+	} finally {
+		savingVersion.value = false;
+	}
+}
+
+// Restoring an old version is a big, rare, explicit change to the working
+// file -- rather than hand-reconcile removedIds/footprints/3D citymodel
+// state against whatever the restored commit actually contained (which has
+// no "removed ids" concept of its own, it's just a plain building set), a
+// full page reload brings 2D+3D both cleanly back in sync with the
+// restored file. Matches this project's own established preference for
+// simple+correct over clever+fragile when a real state discontinuity like
+// this is involved.
+function onRestored() {
+	window.location.reload();
+}
+
 async function fetchAllFootprints() {
 	status2d.value = 'loading island overview…';
 	const { xmin, ymin, xmax, ymax } = FULL_ISLAND_BBOX;
@@ -78,6 +159,18 @@ const highlightFootprintRings = computed(() => {
 	const byId = footprintsById.value;
 	const rings = [];
 	for (const id of crossingIds.value) {
+		const rec = byId[id];
+		if (rec) for (const r of rec.rings) rings.push(r);
+	}
+	return rings;
+});
+
+// Same shape as highlightFootprintRings above, different source id array --
+// see SbgViewer3D.vue/ThreeJsViewer.vue for the outline-overlay rendering.
+const removedFootprintRings = computed(() => {
+	const byId = footprintsById.value;
+	const rings = [];
+	for (const id of removedIds.value) {
 		const rec = byId[id];
 		if (rec) for (const r of rec.rings) rings.push(r);
 	}
@@ -171,15 +264,35 @@ function snapTo2dView() {
 				title="Point the 3D camera at whatever area the 2D view is currently showing"
 				@click="snapTo2dView"
 			>Snap to 2D view</button>
+
+			<span class="edit-controls">
+				<button title="Undo the last removal" :disabled="!sessionStatus.dirty" @click="undo">Undo</button>
+				<span v-if="sessionStatus.dirty" class="unsaved-badge">{{ sessionStatus.count }} unsaved</span>
+				<input
+					v-model="saveNote"
+					class="save-note"
+					type="text"
+					placeholder="note (optional)"
+					:disabled="savingVersion"
+				/>
+				<button title="Commit the current state to version history" :disabled="savingVersion" @click="saveVersion">
+					{{ savingVersion ? 'Saving…' : 'Save Version' }}
+				</button>
+				<button title="View / restore past saved versions" @click="showHistory = !showHistory">History</button>
+			</span>
+			<span v-if="saveError" class="save-error">{{ saveError }}</span>
+
 			<span class="status">
 				{{ status2d }} / {{ status3d }}<span v-if="selectedObjid"> — selected: {{ selectedObjid }}</span>
 			</span>
 		</div>
+		<VersionHistoryPanel v-if="showHistory" @close="showHistory = false" @restored="onRestored" />
 		<div class="stage">
 			<div class="pane" v-show="mode === '2d'">
 				<BoundaryDrawTool
 					ref="boundaryToolRef"
 					:footprints="footprints"
+					:removed-ids="removedIds"
 					@ring-changed="onRingChanged"
 					@selection-changed="onSelectionChanged"
 				/>
@@ -190,8 +303,10 @@ function snapTo2dView() {
 					:selected-objid="selectedObjid"
 					:boundary-ring="boundaryRing"
 					:highlight-footprint-rings="highlightFootprintRings"
+					:removed-footprint-rings="removedFootprintRings"
 					@loaded="on3dLoaded"
 					@object_clicked="onObjectClicked"
+					@building_removed="onBuildingRemoved"
 				/>
 			</div>
 			<div v-else-if="mode === '3d'" class="pane placeholder">switching to 3D…</div>
@@ -240,6 +355,30 @@ body,
 	color: #0b1220;
 	border-color: #4a9eff;
 	font-weight: bold;
+}
+.edit-controls {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding-left: 10px;
+	border-left: 1px solid #3a4358;
+}
+.unsaved-badge {
+	color: #ffb347;
+	white-space: nowrap;
+}
+.save-note {
+	width: 120px;
+	padding: 3px 6px;
+	background: #0b1220;
+	color: #ddd;
+	border: 1px solid #3a4358;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 12px;
+}
+.save-error {
+	color: #ff8080;
 }
 .mode-bar .status {
 	margin-left: auto;

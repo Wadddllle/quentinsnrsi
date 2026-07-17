@@ -43,7 +43,7 @@ const props = defineProps({
 	selectedObjid: { type: String, default: null },
 });
 
-const emit = defineEmits(['object_clicked', 'loaded', 'error']);
+const emit = defineEmits(['object_clicked', 'loaded', 'error', 'building_removed']);
 
 const viewerRef = ref(null);
 const citymodel = shallowRef({});
@@ -151,6 +151,33 @@ const selectedAttributes = computed(() => {
 	return citymodel.value.CityObjects?.[props.selectedObjid]?.attributes ?? null;
 });
 
+// Phase 3 (remove-building): the info panel already resolves a real,
+// existing CityObject id (see selectedAttributes above) -- Remove reuses
+// that directly, no new click/raycast machinery needed. The route uses
+// FastAPI's {building_id:path} converter (see sbg/ui/routers/buildings.py)
+// specifically because ids like "relation/6730642" contain a literal "/" --
+// building the URL with the raw id (not encodeURIComponent, which would
+// turn "/" into "%2F") is what actually reaches that route; this was
+// confirmed directly against the real backend during development.
+const removing = ref(false);
+const removeError = ref(null);
+
+async function removeSelected() {
+	if (!props.selectedObjid || removing.value) return;
+	removing.value = true;
+	removeError.value = null;
+	try {
+		const res = await fetch(`/api/buildings/${props.selectedObjid}/remove`, { method: 'POST' });
+		const data = await res.json();
+		if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+		emit('building_removed', { id: props.selectedObjid, session: data.session });
+	} catch (err) {
+		removeError.value = err.message;
+	} finally {
+		removing.value = false;
+	}
+}
+
 defineExpose({ goTo, resetView });
 </script>
 
@@ -180,6 +207,10 @@ defineExpose({ goTo, resetView });
 					</tr>
 				</tbody>
 			</table>
+			<button class="remove-btn" :disabled="removing" @click="removeSelected">
+				{{ removing ? 'Removing…' : 'Remove building' }}
+			</button>
+			<div v-if="removeError" class="remove-error">{{ removeError }}</div>
 		</div>
 	</div>
 </template>
@@ -239,5 +270,29 @@ defineExpose({ goTo, resetView });
 }
 .info-panel td.v {
 	word-break: break-word;
+}
+.remove-btn {
+	margin-top: 8px;
+	width: 100%;
+	cursor: pointer;
+	padding: 4px 10px;
+	background: #4a1f24;
+	color: #ff8080;
+	border: 1px solid #7a2e35;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 12px;
+}
+.remove-btn:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+.remove-btn:hover:not(:disabled) {
+	background: #5c262d;
+}
+.remove-error {
+	margin-top: 4px;
+	color: #ff8080;
+	font-size: 11px;
 }
 </style>

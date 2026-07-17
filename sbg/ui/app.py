@@ -7,7 +7,6 @@ directly via StaticFiles, so the whole tool is "run one command, open a
 browser tab" with no separate dev server needed. The two-process Vite dev
 server + CORS setup below is for active frontend development only.
 """
-import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,10 +16,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from sbg.config import SBG_OUTPUT
+from sbg.config import DATA_DIR, SBG_OUTPUT
 from sbg.io_cityjson import subset_cityjson
 from sbg.topo.island_terrain import build_masked_island_grid, pack_terrain_binary
-from sbg.ui.routers import cutout, dataset, onemap, pipeline
+from sbg.ui import versioning
+from sbg.ui.routers import buildings, cutout, dataset, onemap, pipeline, session as session_router, versions
+from sbg.ui.session import Session
 from sbg.ui.spatial_index import build_index
 
 WEBUI_DIST = Path(__file__).resolve().parent.parent.parent / "webui" / "dist"
@@ -38,13 +39,30 @@ def create_app(dev: bool = False, dataset_path=None) -> FastAPI:
         # rather than touching disk per request.
         print(f"[sbg.ui] loading {dataset_path} ...")
         t0 = time.time()
-        with open(dataset_path) as f:
-            cm = json.load(f)
+        with open(dataset_path, "rb") as f:
+            cm = orjson.loads(f.read())
         load_elapsed = time.time() - t0
+
+        # Phase 3: capture the version-control baseline from the file AS
+        # JUST LOADED, before any endpoint gets a chance to mutate
+        # app.state.cm -- NOT lazily on first Save Version. Real incident
+        # this fixes: deferring baseline creation to first-save let an
+        # already-in-memory removal get captured as if it were the
+        # original, permanently losing the true pre-edit state for a
+        # building that only survived by luck (an unrelated manual backup
+        # from earlier pipeline work happened to still exist). See
+        # sbg.ui.versioning.ensure_baseline's own docstring.
+        versioning.ensure_baseline(DATA_DIR, dataset_path.name)
+
         index, index_elapsed = build_index(cm)
         app.state.cm = cm
         app.state.spatial_index = index
         app.state.dataset_path = dataset_path
+        # Phase 3: the live editing session's mutation log (undo + version
+        # commit messages) -- see sbg.ui.session.Session. Undo boundary is
+        # the last Save Version (session.clear() there); going further back
+        # is version restore's job (sbg.ui.versioning), not this stack's.
+        app.state.session = Session()
         print(
             f"[sbg.ui] loaded {len(cm['CityObjects'])} CityObjects, "
             f"indexed {len(index.ids)} buildings "
@@ -101,6 +119,9 @@ def create_app(dev: bool = False, dataset_path=None) -> FastAPI:
     app.include_router(cutout.router)
     app.include_router(onemap.router)
     app.include_router(pipeline.router)
+    app.include_router(buildings.router)
+    app.include_router(session_router.router)
+    app.include_router(versions.router)
 
     if not dev and WEBUI_DIST.is_dir():
         app.mount("/", StaticFiles(directory=WEBUI_DIST, html=True), name="webui")

@@ -202,6 +202,18 @@ export default {
 			type: Array,
 			default: () => []
 		},
+		// Phase 3 (remove-building): near-exact copy of highlightFootprintRings
+		// above -- a removed building's real mesh is NOT hidden (see
+		// SbgViewer3D.vue's own comment on why: cityjson-threejs-loader builds
+		// one merged mesh per ~2000-object chunk, not one per building, so
+		// there's no cheap per-building visibility toggle without new
+		// shader/attribute work against undocumented library internals, the
+		// same risk this project already avoided once for the crossing
+		// highlight above). This just flags it with a distinct-colored outline.
+		removedFootprintRings: {
+			type: Array,
+			default: () => []
+		},
 	},
 	data() {
 
@@ -278,6 +290,7 @@ export default {
 			// wrong position until the ring itself happened to change again.
 			this.updateBoundaryRing();
 			this.updateHighlightFootprints();
+			this.updateRemovedFootprints();
 			// Re-shift too: same true-world -> local-frame conversion as the
 			// boundary/highlight overlays, and this citymodel change is the
 			// only thing that re-triggers it if the terrain finished loading
@@ -300,6 +313,15 @@ export default {
 			handler: function () {
 
 				this.updateHighlightFootprints();
+				this.updateScene();
+
+			},
+			deep: true
+		},
+		removedFootprintRings: {
+			handler: function () {
+
+				this.updateRemovedFootprints();
 				this.updateScene();
 
 			},
@@ -501,6 +523,7 @@ export default {
 		this.parser = null;
 		this.boundaryLine = null;
 		this.highlightLines = [];
+		this.removedLines = [];
 		// islandTerrainMesh: the built THREE.Mesh (kept out of data() like
 		// everything else here). terrainRaw: the raw fetched heightfield (a
 		// Float32Array wrapped in a plain object) -- also kept out of
@@ -522,6 +545,7 @@ export default {
 		this.initScene();
 		this.updateBoundaryRing();
 		this.updateHighlightFootprints();
+		this.updateRemovedFootprints();
 
 		this.loadCitymodel( this.citymodel );
 
@@ -1155,6 +1179,7 @@ export default {
 				const res = scope.lineResolution();
 				if ( scope.boundaryLine ) scope.boundaryLine.material.resolution.copy( res );
 				for ( const line of scope.highlightLines ) line.material.resolution.copy( res );
+				for ( const line of scope.removedLines ) line.material.resolution.copy( res );
 
 				scope.updateScene();
 
@@ -1171,7 +1196,7 @@ export default {
 			// coordinate unrelated to any real content), which never fired
 			// before Phase 1 started reloading citymodel after mount. See the
 			// project plan's lighting-bug writeup for how this was found.
-			const keep = new Set( [ this.ambientLight, this.spotLight, this.spotLight.target, this.boundaryLine, this.islandTerrainMesh, ...this.highlightLines ] );
+			const keep = new Set( [ this.ambientLight, this.spotLight, this.spotLight.target, this.boundaryLine, this.islandTerrainMesh, ...this.highlightLines, ...this.removedLines ] );
 			for ( const child of [ ...this.scene.children ] ) {
 
 				if ( ! keep.has( child ) ) this.scene.remove( child );
@@ -1270,6 +1295,41 @@ export default {
 
 				const line = this.makeFatLine( points, 0xff3b1f, 3 );
 				this.highlightLines.push( line );
+				this.scene.add( line );
+
+			}
+
+		},
+		// Phase 3 (remove-building): exact copy of updateHighlightFootprints
+		// above -- see removedFootprintRings prop comment for why this is an
+		// outline overlay, not an actual hide of the underlying mesh. Different
+		// color (dark gray, not the crossing-warning's red) so the two overlay
+		// types read as distinct at a glance.
+		updateRemovedFootprints() {
+
+			for ( const line of this.removedLines ) {
+
+				this.scene.remove( line );
+				line.geometry.dispose();
+				line.material.dispose();
+
+			}
+			this.removedLines = [];
+
+			if ( ! this.removedFootprintRings || this.removedFootprintRings.length === 0 ) return;
+
+			const z = 2; // matches boundaryRing's ground-level offset, see updateBoundaryRing
+			const [ tx, ty ] = this.citymodel?.transform?.translate || [ 0, 0 ];
+
+			for ( const ring of this.removedFootprintRings ) {
+
+				if ( ! ring || ring.length < 2 ) continue;
+
+				const points = ring.map( ( [ x, y ] ) => new THREE.Vector3( x - tx, y - ty, z ) );
+				points.push( points[ 0 ] );
+
+				const line = this.makeFatLine( points, 0x333333, 3 );
+				this.removedLines.push( line );
 				this.scene.add( line );
 
 			}

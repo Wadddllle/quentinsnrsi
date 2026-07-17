@@ -25,6 +25,10 @@ const props = defineProps({
 	ring: { type: Array, default: () => [] },
 	keptIds: { type: Array, default: () => [] },
 	crossingIds: { type: Array, default: () => [] },
+	// Phase 3 (remove-building): ids removed from the working dataset --
+	// reuses the exact same delta-recolor mechanism already built for
+	// keptIds/crossingIds below, just a third paintable state.
+	removedIds: { type: Array, default: () => [] },
 });
 
 const emit = defineEmits(['click', 'view-changed']);
@@ -40,6 +44,7 @@ let boundaryOnly = false; // true while a drag gesture is in progress on control
 const DEFAULT_COLOR = [150 / 255, 160 / 255, 180 / 255];
 const KEPT_COLOR = [74 / 255, 158 / 255, 255 / 255];
 const CROSSING_COLOR = [255 / 255, 99 / 255, 71 / 255];
+const REMOVED_COLOR = [60 / 255, 65 / 255, 75 / 255];
 
 function buildMergedGeometry(footprints) {
 	// Pre-sized typed arrays instead of plain-array .push(): at 118k
@@ -131,7 +136,7 @@ function applySelectionColors() {
 	// individually cheap per element (a few million writes on every
 	// keptIds/crossingIds change adds up during, e.g., rapid boundary-point
 	// placement while drawing).
-	const nextHighlighted = new Set([...props.keptIds, ...props.crossingIds]);
+	const nextHighlighted = new Set([...props.keptIds, ...props.crossingIds, ...props.removedIds]);
 	for (const id of previouslyHighlighted) {
 		if (nextHighlighted.has(id)) continue;
 		const range = vertexRanges[id];
@@ -148,6 +153,10 @@ function applySelectionColors() {
 	};
 	paint(props.keptIds, KEPT_COLOR);
 	paint(props.crossingIds, CROSSING_COLOR);
+	// Painted last so it wins over a stale kept/crossing color for the same
+	// building -- e.g. a building removed mid-boundary-draw shouldn't keep
+	// showing as "kept" or "crossing" once it's gone from the dataset.
+	paint(props.removedIds, REMOVED_COLOR);
 	colorAttr.needsUpdate = true;
 }
 
@@ -283,7 +292,7 @@ function onPointerUpWithDragCheck(evt) {
 }
 
 watch(() => props.footprints, rebuildGeometry);
-watch(() => [props.keptIds, props.crossingIds], () => { applySelectionColors(); render(); }, { deep: true });
+watch(() => [props.keptIds, props.crossingIds, props.removedIds], () => { applySelectionColors(); render(); }, { deep: true });
 watch(() => props.ring, () => { updateRingLine(); render(); }, { deep: true });
 
 function onResize() {
