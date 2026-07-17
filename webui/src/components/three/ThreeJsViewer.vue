@@ -510,6 +510,11 @@ export default {
 		// postMessage'd.
 		this.islandTerrainMesh = null;
 		this.terrainRaw = null;
+		// The last-loaded citymodel's bounding box (real THREE.Box3, kept out
+		// of data() like everything else here) -- lets resetView() snap back
+		// to a known-good extent regardless of where the user's orbit/pan/zoom
+		// left the camera, rather than needing to reload/recompute anything.
+		this.loadedBoundingBox = null;
 
 	},
 	mounted() {
@@ -527,13 +532,13 @@ export default {
 		this.renderer.domElement.addEventListener( 'pointerup', this.pointerUp, false );
 
 		const scope = this;
-		getIslandTerrain().then( data => {
+		// getIslandTerrain().then( data => {
 
-			scope.terrainRaw = data;
-			scope.updateIslandTerrain();
-			scope.updateScene();
+		// 	scope.terrainRaw = data;
+		// 	scope.updateIslandTerrain();
+		// 	scope.updateScene();
 
-		} );
+		// } );
 
 	},
 	methods: {
@@ -603,10 +608,15 @@ export default {
 				const loader = new CityJSONLoader( this.parser );
 				loader.load( citymodel );
 
-				if ( this.autoFitOnLoad ) {
+				// Stored regardless of autoFitOnLoad (cheap -- just a matrix
+				// transform on an already-computed box) so resetView() always
+				// has a real extent to snap back to, not just whatever camera
+				// position the user's orbit/pan/zoom ended up at.
+				const bbox = loader.boundingBox.clone();
+				bbox.applyMatrix4( loader.matrix );
+				this.loadedBoundingBox = bbox;
 
-					const bbox = loader.boundingBox.clone();
-					bbox.applyMatrix4( loader.matrix );
+				if ( this.autoFitOnLoad ) {
 
 					this.fitCameraToSelection( this.camera, this.controls, bbox );
 
@@ -617,7 +627,59 @@ export default {
 			}
 
 		},
-		fitCameraToSelection( camera, controls, box, fitOffset = 1.2 ) {
+		// Distance a perspective camera needs from a box's center to fit the
+		// box's width and height in view (before any fitOffset padding).
+		// Pulled out of fitCameraToSelection so the same math can size the
+		// zoom-out cap (controls.maxDistance) against a DIFFERENT, wider
+		// reference box than whatever's actually being framed right now --
+		// see fitCameraToSelection's maxDistanceBox parameter for why that
+		// split matters.
+		//
+		// Rederived from first principles (found while chasing a "16 scroll
+		// clicks to match" zoom-gap report): a box of world-width sizeX /
+		// world-height sizeY needs distance >= sizeY / (2*tan(halfFovY)) to
+		// fit its height AND distance >= sizeX / (2*tan(halfFovY)*aspect) to
+		// fit its width (dividing by aspect converts a vertical-FOV distance
+		// into a horizontal-equivalent one) -- take the max of both real
+		// constraints. The previous formula collapsed size.x/size.y into one
+		// number BEFORE any distance math ran, then treated it as purely
+		// vertical -- correct only when height happened to be the larger
+		// dimension, silently wrong (overshooting by roughly the aspect
+		// ratio) for any wider-than-tall box, which is the common case since
+		// viewports are landscape. size.z folded into the height side (not
+		// rigorous, matches the original code's own rough intent of not
+		// letting a tall Z-extent clip either) since it isn't meaningfully
+		// affected by the width/height aspect split. Also fixes a second,
+		// compounding bug: the original used Math.atan where the standard
+		// perspective fit-to-size math calls for Math.tan -- atan(x)
+		// computes an angle from a ratio, the wrong operation entirely for
+		// "take the tangent of an angle we already have."
+		_fitDistanceForBox( camera, box ) {
+
+			const size = new THREE.Vector3();
+			box.getSize( size );
+
+			const halfFovY = Math.PI * camera.fov / 360;
+			const fitHeightDistance = Math.max( size.y, size.z ) / ( 2 * Math.tan( halfFovY ) );
+			const fitWidthDistance = size.x / ( 2 * Math.tan( halfFovY ) * camera.aspect );
+			return Math.max( fitHeightDistance, fitWidthDistance );
+
+		},
+		// maxDistanceBox: the box used to size controls.maxDistance (how far
+		// the user can zoom OUT), separate from `box` (what's actually being
+		// framed right now). Defaults to `box` itself when not given, which
+		// is correct for the initial full-extent load and resetView() (the
+		// box already IS the full extent there). Real bug found via direct
+		// user report ("snap to 2D view... cant zoom out th see the whole
+		// island anymore"): every fit call used to set maxDistance from
+		// whatever box it was CURRENTLY framing, so snapping to a small
+		// zoomed-in 2D area would shrink the zoom-out cap down to ~10x that
+		// tiny area, permanently (until a manual Reset View) losing the
+		// ability to zoom back out to island scale. Callers that fit a small
+		// target while wanting to preserve the full-scene zoom range (goTo,
+		// used by both search navigation and snapTo2dView) pass the
+		// viewer's own loadedBoundingBox here instead.
+		fitCameraToSelection( camera, controls, box, fitOffset = 1.2, topDown = false, maxDistanceBox = null ) {
 
 			// From https://discourse.threejs.org/t/camera-zoom-to-fit-object/936/24
 
@@ -633,26 +695,71 @@ export default {
 			box.getSize( size );
 			box.getCenter( center );
 
+			// Still used below for the spotlight's offset scale (a rough "how
+			// big is this scene" reference, unrelated to the camera-distance
+			// fit math) -- kept as its own variable rather than folded into
+			// _fitDistanceForBox, which deliberately no longer uses a single
+			// pre-mixed maxSize.
 			const maxSize = Math.max( size.x, size.y, size.z );
-			const fitHeightDistance = maxSize / ( 2 * Math.atan( Math.PI * camera.fov / 360 ) );
-			const fitWidthDistance = fitHeightDistance / camera.aspect;
-			const distance = fitOffset * Math.max( fitHeightDistance, fitWidthDistance );
 
-			const direction = controls.target.clone()
-				.sub( camera.position )
-				.normalize()
-				.multiplyScalar( distance );
+			const distance = fitOffset * this._fitDistanceForBox( camera, box );
 
-			controls.maxDistance = distance * 10;
+			controls.maxDistance = this._fitDistanceForBox( camera, maxDistanceBox || box ) * 10;
 			controls.target.copy( center );
 
 			camera.near = distance / 100;
 			camera.far = distance * 100;
 			camera.updateProjectionMatrix();
 
-			camera.position.copy( controls.target ).sub( direction );
+			if ( topDown ) {
 
-			controls.update();
+				// "Reset View"/"Snap to 2D view" both want a clean, deterministic
+				// top-down orientation, not whatever angle the camera happened to
+				// be at before -- straight reuse of the code below (which derives
+				// direction from the CURRENT camera position) would just preserve
+				// that old angle instead of resetting it.
+				//
+				// Can't get there by positioning the camera straight up and
+				// calling controls.update() alone: OrbitControls.update() always
+				// ends with object.lookAt(target) using camera.up (fixed at
+				// world +Z here, see initScene()) -- confirmed by reading
+				// OrbitControls.js directly -- and that lookAt is geometrically
+				// degenerate exactly when the view direction is parallel to
+				// camera.up, which is exactly true for a perfectly vertical
+				// camera. The resulting on-screen "roll" (which way is up) would
+				// be arbitrary/unstable rather than matching anything.
+				//
+				// Fixed by positioning+updating first (so OrbitControls' own
+				// internal spherical/clamped state resyncs correctly for
+				// whatever the user does next -- update() reads camera.position
+				// fresh every call, confirmed in source, so this is safe even
+				// though its own lookAt result gets thrown away immediately
+				// after), then overwriting the final orientation with an
+				// explicitly-constructed matrix using world +Y as the up
+				// reference instead of camera.up -- non-degenerate (Y is
+				// perpendicular to a straight-down view, not parallel to it) and
+				// matches OrthoWebGLView's 2D camera exactly (it also uses
+				// up=(0,1,0)), which is the whole point: same world direction
+				// reads as "up on screen" in both views, so switching between
+				// them doesn't feel like the content silently rotated.
+				camera.position.set( center.x, center.y, center.z + distance );
+				controls.update();
+
+				const m = new THREE.Matrix4().lookAt( camera.position, center, new THREE.Vector3( 0, 1, 0 ) );
+				camera.quaternion.setFromRotationMatrix( m );
+
+			} else {
+
+				const direction = controls.target.clone()
+					.sub( camera.position )
+					.normalize()
+					.multiplyScalar( distance );
+
+				camera.position.copy( controls.target ).sub( direction );
+
+				controls.update();
+
+			}
 
 			// Overhead "sun" light, fixed to the actual loaded content's bounding
 			// box (not world origin -- our real EPSG:3414 data sits ~30,000 units
@@ -879,6 +986,43 @@ export default {
 			this.renderer.setClearColor( this.backgroundColor );
 			this.renderer.setPixelRatio( window.devicePixelRatio );
 
+			// Real, likely cause of the "3D view randomly goes black, not
+			// reproducible, fixed by a refresh" report: confirmed via grep that
+			// NOTHING in this codebase (or ninja's, which this was ported from)
+			// ever listened for 'webglcontextlost'. By spec, if nothing calls
+			// preventDefault() on that event, the browser does not even attempt
+			// automatic context restoration -- the canvas just stays black
+			// forever until the page reloads. Real-world triggers for a context
+			// loss are exactly the kind of thing that wouldn't reproduce on
+			// demand: GPU driver reset, laptop integrated/discrete GPU
+			// switching, OS reclaiming GPU memory under pressure, or simply too
+			// many WebGL contexts open across tabs (this app alone runs two,
+			// one for 2D's OrthoWebGLView and one for this 3D view, both
+			// mounted for the whole session once activated).
+			this.renderer.domElement.addEventListener( 'webglcontextlost', ( event ) => {
+
+				event.preventDefault();
+				console.warn( '[ThreeJsViewer] WebGL context lost -- attempting recovery on restore.' );
+
+			}, false );
+			this.renderer.domElement.addEventListener( 'webglcontextrestored', () => {
+
+				console.warn( '[ThreeJsViewer] WebGL context restored -- forcing a full re-render.' );
+				// Materials compiled before the context loss reference GPU
+				// resources that no longer exist -- same needsUpdate trick
+				// already used in onComplete() to force a shader recompile
+				// after real geometry/lights are in place, reused here for the
+				// same underlying reason (stale compiled state, different
+				// cause).
+				this.scene.traverse( c => {
+
+					if ( c.material ) c.material.needsUpdate = true;
+
+				} );
+				this.updateScene();
+
+			}, false );
+
 			const composer = new EffectComposer( this.renderer );
 			this.composer = composer;
 
@@ -914,18 +1058,27 @@ export default {
 			const outputPass = new OutputPass();
 			composer.addPass( outputPass );
 
+			// Real pre-existing bug, found chasing an unrelated crash while
+			// testing with ?debug for the first time in this project: both
+			// references below used the bare local `gtaoPass` instead of
+			// `this.gtaoPass` -- a plain ReferenceError the instant this
+			// block ran, since no local of that name is ever declared here.
+			// Never caught before because nothing in this project had
+			// actually exercised the debug GUI panel end-to-end.
 			const updateGtaoMaterial = () => {
 
-				gtaoPass.updateGtaoMaterial( aoParameters );
+				this.gtaoPass.updateGtaoMaterial( aoParameters );
 				this.updateScene();
 
 			};
 
 			if ( "debug" in this.getParams() ) {
 
+				window.__threeJsViewerCamera = this.camera; // for console/automated inspection only
+
 				const gui = new GUI();
 
-				gui.add( gtaoPass, 'blendIntensity' ).min( 0 ).max( 1 ).step( 0.01 );
+				gui.add( this.gtaoPass, 'blendIntensity' ).min( 0 ).max( 1 ).step( 0.01 );
 				gui.add( aoParameters, 'radius' ).min( 0.01 ).max( 10 ).step( 0.1 ).onChange( updateGtaoMaterial );
 				gui.add( aoParameters, 'distanceExponent' ).min( 1 ).max( 4 ).step( 0.01 ).onChange( updateGtaoMaterial );
 				gui.add( aoParameters, 'thickness' ).min( 0.01 ).max( 10 ).step( 0.1 ).onChange( updateGtaoMaterial );
@@ -959,6 +1112,7 @@ export default {
 			this.scene.add( this.spotLight.target ); // repositioned once the real content loads, see fitCameraToSelection
 
 			this.controls = new OrbitControls( this.camera, this.renderer.domElement );
+			if ( "debug" in this.getParams() ) window.__threeJsViewerControls = this.controls; // for console/automated inspection only
 			// A real floor on how close the camera can dolly in -- without this,
 			// OrbitControls' zoom is multiplicative (each scroll notch scales the
 			// remaining distance by a fixed percentage), so it asymptotically
@@ -1124,6 +1278,22 @@ export default {
 		getLods() {
 
 			return this.lods;
+
+		},
+		// "Stuck in zoom hell" fix: OrbitControls' dolly is multiplicative, so
+		// a bad sequence of scroll gestures (or a fast trackpad fling) can land
+		// the camera absurdly close to or far from the actual content with no
+		// obvious way back short of a page reload. Re-fitting to the
+		// last-loaded citymodel's real extent (stored in loadCitymodel(), see
+		// beforeCreate()) is the same math the initial auto-fit already uses,
+		// just callable on demand. topDown=true per direct user request --
+		// a reset should also clear out whatever odd viewing angle you were
+		// stuck at, not just the distance.
+		resetView() {
+
+			if ( ! this.loadedBoundingBox ) return;
+			this.fitCameraToSelection( this.camera, this.controls, this.loadedBoundingBox, 1.2, true );
+			this.updateScene();
 
 		},
 		updateIslandTerrain() {

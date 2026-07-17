@@ -1,5 +1,5 @@
 <script setup>
-import { ref, shallowRef, onMounted } from 'vue';
+import { ref, shallowRef, computed, onMounted } from 'vue';
 import * as THREE from 'three';
 import ThreeJsViewer from './ThreeJsViewer.vue';
 import { getFullIslandCitymodel } from '../../composables/fullIslandData.js';
@@ -90,16 +90,42 @@ function onChunkLoaded() {
 // own fitCameraToSelection (already proven, see Phase 1's lighting-bug
 // writeup) with a small local box instead of writing new camera-placement
 // math.
-function goTo(worldX, worldY, radius = 300) {
+//
+// halfWidth/halfHeight separate (not one shared radius) so a caller can pass
+// an exact, possibly non-square rectangle -- needed for snapTo2dView in
+// App.vue, which wants the 3D frame to match 2D's actual current viewport
+// aspect, not force it square.
+//
+// The box's Z range used to be a fixed [0, 100] regardless of the requested
+// footprint size -- harmless for the original 300m-radius search-navigation
+// case, but a real bug for a tight zoomed-in snap: fitCameraToSelection's
+// distance formula takes max(size.x, size.y, size.z), so for e.g. a 60m-wide
+// request that arbitrary 100 would dominate and zoom out further than
+// asked, silently distorting the fit. Using a near-zero Z extent instead
+// means the fit is driven purely by the requested footprint, matching what
+// the caller actually asked for.
+//
+// Passes the viewer's own loadedBoundingBox as fitCameraToSelection's
+// maxDistanceBox -- otherwise the zoom-OUT cap would shrink to ~10x
+// whatever small area goTo() just framed, permanently losing the ability
+// to zoom back out to island scale until a manual Reset View. Real user
+// report: "snap to 2D view... cant zoom out th see the whole island
+// anymore" -- goTo() is exactly the path both search navigation and
+// snapTo2dView go through.
+function goTo(worldX, worldY, halfWidth = 300, halfHeight = halfWidth, options = {}) {
 	const viewer = viewerRef.value;
 	if (!viewer || !viewer.camera) return;
 	const localX = worldX - localFrameOffset.value.x;
 	const localY = worldY - localFrameOffset.value.y;
 	const box = new THREE.Box3(
-		new THREE.Vector3(localX - radius, localY - radius, 0),
-		new THREE.Vector3(localX + radius, localY + radius, 100)
+		new THREE.Vector3(localX - halfWidth, localY - halfHeight, 0),
+		new THREE.Vector3(localX + halfWidth, localY + halfHeight, 0)
 	);
-	viewer.fitCameraToSelection(viewer.camera, viewer.controls, box);
+	viewer.fitCameraToSelection(
+		viewer.camera, viewer.controls, box,
+		options.fitOffset ?? 1.2, options.topDown ?? false,
+		viewer.loadedBoundingBox
+	);
 }
 
 onMounted(loadFullIsland);
@@ -108,7 +134,24 @@ function onObjectClicked(info) {
 	emit('object_clicked', info);
 }
 
-defineExpose({ goTo });
+function resetView() {
+	viewerRef.value?.resetView();
+}
+
+// The click handler already resolves a real objid via
+// resolveIntersectionInfo() (see ThreeJsViewer's handleClick) -- the
+// building's full attributes are just citymodel.CityObjects[id].attributes,
+// already sitting in memory (this is the same full-island fetch that
+// already backs the 3D geometry itself), so no new endpoint/request is
+// needed to show them. Previously that objid only ever reached the status
+// bar as a bare id string, which is useless without the source JSON open
+// next to it -- direct user complaint this addresses.
+const selectedAttributes = computed(() => {
+	if (!props.selectedObjid) return null;
+	return citymodel.value.CityObjects?.[props.selectedObjid]?.attributes ?? null;
+});
+
+defineExpose({ goTo, resetView });
 </script>
 
 <template>
@@ -126,6 +169,17 @@ defineExpose({ goTo });
 		<div v-if="fetching || parsing" class="loading-badge">
 			<span v-if="fetching">fetching…</span>
 			<span v-else>rendering… ({{ chunkProgress }} / ~{{ chunkEstimateTotal }} chunks)</span>
+		</div>
+		<div v-if="selectedAttributes" class="info-panel">
+			<div class="info-panel-header">{{ selectedObjid }}</div>
+			<table>
+				<tbody>
+					<tr v-for="(value, key) in selectedAttributes" :key="key">
+						<td class="k">{{ key }}</td>
+						<td class="v">{{ value === null || value === '' ? '—' : value }}</td>
+					</tr>
+				</tbody>
+			</table>
 		</div>
 	</div>
 </template>
@@ -147,5 +201,43 @@ defineExpose({ goTo });
 	border-radius: 4px;
 	font-family: monospace;
 	font-size: 12px;
+}
+.info-panel {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	z-index: 10;
+	background: rgba(11, 18, 32, 0.92);
+	color: #ddd;
+	border: 1px solid #3a4358;
+	border-radius: 6px;
+	padding: 8px 10px;
+	font-family: monospace;
+	font-size: 12px;
+	max-width: 320px;
+	max-height: 70vh;
+	overflow-y: auto;
+}
+.info-panel-header {
+	font-weight: bold;
+	color: #4a9eff;
+	margin-bottom: 6px;
+	word-break: break-all;
+}
+.info-panel table {
+	border-collapse: collapse;
+	width: 100%;
+}
+.info-panel td {
+	padding: 1px 4px;
+	vertical-align: top;
+}
+.info-panel td.k {
+	color: #8a97ad;
+	white-space: nowrap;
+	padding-right: 8px;
+}
+.info-panel td.v {
+	word-break: break-word;
 }
 </style>

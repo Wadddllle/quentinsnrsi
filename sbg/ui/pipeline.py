@@ -12,6 +12,7 @@ in-memory dataset (app.state.cm) via conforming_overlay's own domain
 filtering, since that's what a terrain-draped conforming mesh needs anyway --
 the plain cutout file isn't an input to this chain at all.
 """
+import json
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from pathlib import Path
 from shapely.geometry import Polygon
 
 from sbg.config import BLENDER_PATH
-from sbg.io_cityjson import finalize_and_save
+from sbg.io_cityjson import finalize_and_save, split_composite_solids
 from sbg.topo.conforming_mesh import conforming_overlay
 from sbg.topo.dtm import ElevationLookup, build_dtm, load_points, write_geotiff
 
@@ -113,9 +114,27 @@ def run_stl_pipeline(job, sbg_cm, ring, jobs_root, spatial_index=None):
     job.log_line(f"wrote {conforming_path} ({len(conforming_cm['CityObjects'])} CityObjects)")
 
     job.set_stage("obj_export")
+    # cjio 0.10.1's OBJ exporter silently drops all geometry for
+    # CompositeSolid CityObjects (confirmed by reading cjio/cityjson.py's
+    # export2obj() directly: it only handles MultiSurface/CompositeSurface/
+    # Solid, so a CompositeSolid object's `o <id>` marker gets written with
+    # zero faces after it -- no error, no warning). CompositeSolid is
+    # exactly what extrude.py produces for any MultiPolygon footprint (an
+    # OSM relation with disjoint parts, e.g. twin towers under one building)
+    # -- real, not rare: this is what caused the reported "holes" in STL
+    # output (buildings that render fine in the plain CityJSON 3D viewer,
+    # which never goes through cjio's OBJ path). Worked around by exporting
+    # a throwaway split copy instead of patching cjio itself -- see
+    # split_composite_solids()'s docstring for why splitting is safe here
+    # (Blender's later join step fuses every object regardless of identity).
+    obj_export_cm = split_composite_solids(conforming_cm)
+    obj_export_path = job_dir / "conforming_for_obj.city.json"
+    with open(obj_export_path, "w") as f:
+        json.dump(obj_export_cm, f)
+
     obj_path = job_dir / "conforming.obj"
     cjio_bin = Path(sys.executable).parent / "cjio"
-    _run_subprocess(job, [str(cjio_bin), str(conforming_path), "export", "obj", str(obj_path)])
+    _run_subprocess(job, [str(cjio_bin), str(obj_export_path), "export", "obj", str(obj_path)])
 
     # export_stl.py no longer decimates (moved to fast_simplification below,
     # ~9-10x faster than Blender's COLLAPSE on this scale -- see repair_stl.py's

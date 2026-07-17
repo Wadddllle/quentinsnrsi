@@ -225,6 +225,55 @@ def subset_cityjson(cm, obj_ids):
     return new_cm
 
 
+def split_composite_solids(cm):
+    """Returns a copy of cm where every CompositeSolid-geometried CityObject
+    is replaced by one Solid-typed pseudo-object per part (ids
+    "<id>__part<i>"), for consumption by cjio's OBJ exporter.
+
+    Root-caused directly (not a guess): cjio 0.10.1's export2obj()
+    (cjio/cityjson.py) only handles MultiSurface/CompositeSurface/Solid
+    geometry types -- CompositeSolid falls through every branch unhandled,
+    so the object's `o <id>` line gets written but faces_to_obj() is never
+    called for it, silently producing zero faces. CompositeSolid is exactly
+    what sbg/extrude.py emits for any MultiPolygon footprint (an OSM
+    `relation` with disjoint parts -- e.g. twin towers modeled as one
+    building), not a rare edge case: confirmed by dumping every `o` marker
+    in a real STL job's exported OBJ and finding each CompositeSolid
+    building's marker immediately followed by the next object's marker with
+    no vertex/face lines in between.
+
+    Only meant for a throwaway pre-OBJ-export copy, never the real output
+    file -- splitting loses the "these parts are one building" CityJSON
+    semantic, which doesn't matter here since the STL pipeline's later
+    Blender join step fuses every object into one mesh soup regardless of
+    CityObject identity anyway. Vertex indices are untouched (same shared
+    vertex list, same transform) -- this only re-partitions which
+    CityObject entry owns which already-built geometry, so no VertexPool
+    involved and no need to re-run finalize_and_save.
+    """
+    new_objects = {}
+    for obj_id, obj in cm["CityObjects"].items():
+        composite_geoms = [g for g in obj.get("geometry", []) if g["type"] == "CompositeSolid"]
+        if not composite_geoms:
+            new_objects[obj_id] = obj
+            continue
+        other_geoms = [g for g in obj.get("geometry", []) if g["type"] != "CompositeSolid"]
+        if other_geoms:
+            new_objects[obj_id] = {**obj, "geometry": other_geoms}
+        part_n = 0
+        for geom in composite_geoms:
+            for solid in geom["boundaries"]:
+                new_objects[f"{obj_id}__part{part_n}"] = {
+                    "type": obj["type"],
+                    "attributes": obj["attributes"],
+                    "geometry": [{"type": "Solid", "lod": geom.get("lod", "1"), "boundaries": solid}],
+                }
+                part_n += 1
+    new_cm = dict(cm)
+    new_cm["CityObjects"] = new_objects
+    return new_cm
+
+
 def finalize_and_save(cm, pool, path):
     """Sets cm['transform']/cm['vertices'] from the pool and writes cm to path."""
     transform = pool.compute_transform()

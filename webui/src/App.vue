@@ -114,6 +114,49 @@ function on3dLoaded({ count }) {
 function onObjectClicked(info) {
 	selectedObjid.value = info ? info[0] : null;
 }
+
+// "Stuck in zoom hell" QoL fix -- one button, re-fits whichever view is
+// currently active back to its full loaded extent. Both viewers already
+// track their own real extent internally (see resetView() in
+// ThreeJsViewer.vue/OrthoWebGLView.vue), so this just calls whichever one is
+// on screen rather than duplicating that bookkeeping here.
+function resetView() {
+	if (mode.value === '2d') {
+		boundaryToolRef.value?.resetView();
+	} else {
+		viewer3dRef.value?.resetView();
+	}
+}
+
+// "Add a button to snap camera in 3D view from 2D view orientation" -- reads
+// the 2D camera's current visible extent and points the 3D camera at the
+// same real-world area. Deliberately an explicit action, not automatic on
+// every mode switch (that dual-mode design was tried and dropped earlier
+// per direct user instruction -- see the comment block above -- this is a
+// much smaller, opt-in version of the same idea, not a revival of it).
+//
+// Two follow-up fixes after real testing showed content wasn't actually
+// overlapping between the two views on switch:
+// - topDown: true forces a clean straight-down orientation matching
+//   OrthoWebGLView's 2D camera (see fitCameraToSelection's topDown branch)
+//   -- previously the 3D camera kept whatever angle it already had, so even
+//   a perfectly-matched center/zoom still LOOKED different.
+// - halfWidth/halfHeight passed separately (2D's exact bounds, not a single
+//   square radius) with fitOffset: 1.0 (no padding) -- goTo's default
+//   fitOffset is 1.2 (a deliberate 20% margin for general search
+//   navigation), but that margin means the 3D frame would show MORE area
+//   than 2D's exact current view, i.e. look more "zoomed out" -- exactly
+//   the "zoom's not perfect" symptom reported. 1.0 matches 2D's framing
+//   exactly instead of padding it.
+function snapTo2dView() {
+	const bounds = boundaryToolRef.value?.getViewBounds();
+	if (!bounds || !has3DBeenActivated.value) return;
+	const { xmin, ymin, xmax, ymax } = bounds;
+	const cx = (xmin + xmax) / 2, cy = (ymin + ymax) / 2;
+	const halfWidth = (xmax - xmin) / 2;
+	const halfHeight = (ymax - ymin) / 2;
+	viewer3dRef.value?.goTo(cx, cy, halfWidth, halfHeight, { fitOffset: 1.0, topDown: true });
+}
 </script>
 
 <template>
@@ -122,6 +165,12 @@ function onObjectClicked(info) {
 			<button :class="{ active: mode === '2d' }" @click="activateMode('2d')">2D</button>
 			<button :class="{ active: mode === '3d' }" @click="activateMode('3d')">3D</button>
 			<LocationSearchBox @goto="onGoto" />
+			<button title="Reset the camera to the full loaded extent" @click="resetView">Reset View</button>
+			<button
+				v-if="mode === '3d'"
+				title="Point the 3D camera at whatever area the 2D view is currently showing"
+				@click="snapTo2dView"
+			>Snap to 2D view</button>
 			<span class="status">
 				{{ status2d }} / {{ status3d }}<span v-if="selectedObjid"> — selected: {{ selectedObjid }}</span>
 			</span>

@@ -33,6 +33,7 @@ const containerRef = ref(null);
 let renderer, scene, camera, controls, mesh, colorAttr;
 let vertexRanges = {}; // buildingId -> [startVertex, endVertexExclusive]
 let hasAutoFitted = false;
+let fullExtentBounds = null; // {xmin,ymin,xmax,ymax} of all loaded footprints, for resetView()
 let ringLine = null;
 let boundaryOnly = false; // true while a drag gesture is in progress on controls -- avoids fighting MapControls' own render loop
 
@@ -173,8 +174,19 @@ function rebuildGeometry() {
 			if (x < xmin) xmin = x; if (x > xmax) xmax = x;
 			if (y < ymin) ymin = y; if (y > ymax) ymax = y;
 		}
+		fullExtentBounds = { xmin, ymin, xmax, ymax };
 		fitBounds(xmin, ymin, xmax, ymax, 0.02);
 	}
+}
+
+// "Zoom hell" fix, same underlying complaint as the 3D view's resetView():
+// MapControls' zoom can leave the camera absurdly far in or out with no
+// obvious way back. Re-fit to the full loaded extent computed once above,
+// callable on demand instead of only at initial load.
+function resetView() {
+	if (!fullExtentBounds) return;
+	const { xmin, ymin, xmax, ymax } = fullExtentBounds;
+	fitBounds(xmin, ymin, xmax, ymax, 0.02);
 }
 
 function lineResolution() {
@@ -303,6 +315,22 @@ onMounted(() => {
 	renderer.outputColorSpace = THREE.SRGBColorSpace;
 	el.appendChild(renderer.domElement);
 
+	// Same fix as ThreeJsViewer.vue's 3D renderer, same reasoning: without
+	// calling preventDefault() here, a lost WebGL context never gets
+	// automatically restored by the browser -- it just stays black. This
+	// view runs its own separate WebGLRenderer/context from the 3D one, so
+	// needs its own listener.
+	renderer.domElement.addEventListener('webglcontextlost', (event) => {
+		event.preventDefault();
+		console.warn('[OrthoWebGLView] WebGL context lost -- attempting recovery on restore.');
+	}, false);
+	renderer.domElement.addEventListener('webglcontextrestored', () => {
+		console.warn('[OrthoWebGLView] WebGL context restored -- rebuilding geometry and re-rendering.');
+		rebuildGeometry();
+		updateRingLine();
+		render();
+	}, false);
+
 	controls = new MapControls(camera, renderer.domElement);
 	controls.target.set(29500, 30500, 0);
 	controls.enableRotate = false; // top-down 2D view -- no orbit, pan + zoom only
@@ -325,7 +353,7 @@ onBeforeUnmount(() => {
 	renderer?.dispose();
 });
 
-defineExpose({ getViewBounds, fitBounds, flyTo });
+defineExpose({ getViewBounds, fitBounds, flyTo, resetView });
 </script>
 
 <template>

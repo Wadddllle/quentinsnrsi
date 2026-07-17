@@ -243,6 +243,7 @@ defineExpose({
 	getViewBounds: () => viewRef.value?.getViewBounds(),
 	fitBounds: (...args) => viewRef.value?.fitBounds(...args),
 	flyTo: (...args) => viewRef.value?.flyTo(...args),
+	resetView: () => viewRef.value?.resetView(),
 });
 </script>
 
