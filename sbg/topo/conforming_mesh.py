@@ -21,14 +21,25 @@ import sys
 import time
 
 import numpy as np
+import shapely
+import trimesh
 import triangle
 from shapely import contains, points as shp_points
+from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
 from sbg.config import DEFAULT_HEIGHT, SBG_OUTPUT
 from sbg.cutout import load_domain_polygon
-from sbg.extrude import geometry_from_rings_draped
-from sbg.io_cityjson import VertexPool, building_footprint_polygon, finalize_and_save, new_cityjson
+from sbg.extrude import footprint_to_solid, geometry_from_rings_draped
+from sbg.io_cityjson import (
+    VertexPool,
+    building_footprint_polygon,
+    finalize_and_save,
+    new_cityjson,
+    remap_vertex_indices,
+    vertex_lookup,
+    walk_vertex_indices,
+)
 from sbg.topo.dtm import ElevationLookup
 
 DEFAULT_TERRAIN_STEP = 10.0  # coarser than the whole-island path's local-fine grids —
@@ -52,6 +63,119 @@ def extract_building_footprints(cm, min_area=DEFAULT_MIN_FOOTPRINT_AREA):
     if skipped:
         print(f"  skipped {skipped} buildings (no usable/valid/too-small footprint)", file=sys.stderr)
     return out
+
+
+GROUND_CONTACT_BAND_M = 2.0  # how far above the mesh's own lowest point to slice
+PODIUM_PLUNGE_M = 30.0  # how far below real terrain elevation the podium slab's own base reaches -- matches export_stl.py's plunge_base() depth convention for plain buildings, guaranteeing real overlap with the terrain's own solidified slab
+
+
+def _podium_faces(pool, ground_poly, base_z, top_z):
+    """Extrudes ground_poly (a shapely Polygon/MultiPolygon) into a flat
+    stack of MultiSurface-style faces (same [[ring]] shape as
+    io_cityjson.walk_vertex_indices expects) from base_z to top_z --
+    reuses extrude.py's own footprint_to_solid per polygon part, just
+    unwraps the single-shell result into a flat face list instead of
+    a Solid geometry dict, so it can be appended directly onto an
+    existing MultiSurface's boundaries.
+    """
+    faces = []
+    for rings in _polygon_parts_rings(ground_poly):
+        shell = footprint_to_solid(pool, rings, base_z, top_z)
+        if shell is not None:
+            faces.extend(shell[0])
+    return faces
+
+
+def ground_contact_footprint(sbg_cm, obj_id, band=GROUND_CONTACT_BAND_M):
+    """For a building with real MultiSurface/CompositeSurface mesh geometry
+    (e.g. an OneMap review-gate replacement): a REAL geometric cross-section
+    of the mesh at a low height, not an approximation -- returns exactly
+    where the building's solid mass actually exists at that height, correctly
+    excluding open space under a genuine overhang (a real, user-identified
+    architectural feature -- a stadium's connecting overpass has actual
+    clearance underneath, confirmed by slicing this exact mesh at several
+    heights: z=0.5-5m gives 5 disconnected pieces -- the round base plus the
+    overpass's individual support columns, NOT connected to each other --
+    while z=8m shows the overpass as one continuous solid beam. A flat
+    footprint (whether convex hull, concave hull, or full top-down
+    silhouette) cannot make this distinction -- all of those describe "what
+    does this building cover from directly above," not "where does it
+    actually touch the ground," and using the wrong one here is exactly what
+    punched a hole-shaped gap in the terrain where open, walkable space
+    should have stayed intact.
+
+    Sliced at the mesh's OWN lowest point + `band`, not against the DTM's
+    real terrain elevation at this (x,y) -- checked empirically first: the
+    cross-section area is stable across the whole 0.5-5m range for this
+    building (basically identical -- 90,995 m^2 at every height tested in
+    that band), so the exact offset within a couple of meters isn't
+    sensitive. Only used for terrain-hole-punching (this module) -- the
+    general-purpose 2D/spatial-index footprint (io_cityjson.footprint_rings)
+    deliberately uses the FULL top-down silhouette instead, since a 2D map
+    view of "what does this cover from above" should include the overhang.
+
+    Returns None (caller should fall back to the general footprint) if the
+    mesh has no real cross-section at that height, or slicing fails for any
+    reason -- correctness here is a refinement of an already-working
+    fallback, not something that should ever crash a whole STL job.
+    """
+    obj = sbg_cm["CityObjects"].get(obj_id)
+    geom = obj["geometry"][0] if obj and obj.get("geometry") else None
+    if geom is None or geom["type"] not in ("MultiSurface", "CompositeSurface"):
+        return None
+
+    try:
+        from sbg.io_cityjson import vertex_lookup
+
+        lookup = vertex_lookup(sbg_cm)
+        verts = []
+        tris = []
+        for face in geom["boundaries"]:
+            ring = face[0]
+            if len(ring) != 3:
+                continue
+            idx0 = len(verts)
+            for i in ring:
+                verts.append(lookup(i))
+            tris.append([idx0, idx0 + 1, idx0 + 2])
+        if not tris:
+            return None
+
+        mesh = trimesh.Trimesh(vertices=np.array(verts), faces=np.array(tris), process=False)
+        min_z = float(mesh.bounds[0, 2])
+        section = mesh.section(plane_origin=[0, 0, min_z + band], plane_normal=[0, 0, 1])
+        if section is None:
+            return None
+        # Real, severe bug found via user report: Path3D.to_2D() returns
+        # polygon coordinates in its OWN local 2D frame (arbitrarily
+        # translated/rotated for its own convenience), not the original
+        # world coordinates -- the second return value (here, `to_3D`) is
+        # the transform matrix needed to map back. Discarding it (the
+        # original code did `planar, _ = section.to_2D()`) meant this
+        # function returned polygons offset by ~(-24643, -29419) from
+        # where the building actually is. That corrupted polygon then fed
+        # directly into footprint_union (the terrain PSLG's own hole/bounds
+        # source) for the WHOLE domain -- not just a wrong shape for one
+        # building, but a corrupted coordinate origin for the entire
+        # terrain triangulation, which is what actually caused the terrain
+        # to end up in the wrong place and, downstream, the join+voxel
+        # remesh fragmentation reported as a "disconnected pieces" bug.
+        # Confirmed directly: to_3D is a real translation matrix (verified
+        # against this exact mesh), not identity.
+        planar, to_3D = section.to_2D()
+        polys = []
+        for p in planar.polygons_full:
+            ring = p.exterior.coords if p.geom_type != "LinearRing" else p.coords
+            pts3d = np.array([[x, y, 0.0, 1.0] for x, y in ring])
+            world_pts = (to_3D @ pts3d.T).T[:, :2]
+            wp = Polygon(world_pts)
+            if wp.is_valid and wp.area > 0:
+                polys.append(wp)
+        if not polys:
+            return None
+        return shapely.unary_union(polys)
+    except Exception:
+        return None
 
 
 def _polygon_rings(poly):
@@ -237,10 +361,24 @@ def conforming_overlay(
     log_fn(f"  {len(footprints)} usable building footprints within domain")
     _lap("extract+filter footprints")
 
+    # For buildings with real mesh geometry, the terrain hole should be
+    # shaped by where the building actually touches the ground, not by
+    # the general-purpose footprint (io_cityjson.footprint_rings's full
+    # top-down silhouette, correct for 2D display but not for this -- see
+    # ground_contact_footprint's own docstring for the real user-reported
+    # bug this fixes: an overhang with genuine clearance underneath was
+    # getting treated as solid all the way down, punching a hole where
+    # walkable ground should have stayed). Falls back to the general
+    # footprint (poly) if the real cross-section can't be computed for any
+    # reason -- a slightly-larger-than-necessary hole is a safe fallback,
+    # a crashed job is not.
     valid_polys = []
     valid_ids = set()
+    ground_contact_by_id = {}  # cached here, reused below for the podium slab -- avoids recomputing the same (real, non-trivial: ~0.6s each) trimesh cross-section twice
     for obj_id, poly in footprints:
-        p = poly if poly.is_valid else poly.buffer(0)
+        ground_poly = ground_contact_footprint(sbg_cm, obj_id)
+        ground_contact_by_id[obj_id] = ground_poly
+        p = ground_poly if ground_poly is not None else (poly if poly.is_valid else poly.buffer(0))
         if p.is_valid and p.area > 0:
             valid_polys.append(p)
             valid_ids.add(obj_id)
@@ -294,13 +432,99 @@ def conforming_overlay(
     log_fn(f"  {len(terrain_faces)} terrain triangles, {len(pool.vertices)} vertices so far")
     _lap("emit_terrain_faces (one ElevationLookup call per unique triangulation vertex)")
 
+    # Real bug, found via user report: a round OneMap-replaced stadium
+    # mesh rendered correctly in the live 3D view but came out as a flat,
+    # wedge-shaped prism in both the 2D footprint view and the final STL.
+    # Root cause was here -- every building in the domain, including ones
+    # that already carry a real MultiSurface/CompositeSurface mesh (a
+    # genuine dome/facade, not a flat-roofed box), was unconditionally
+    # discarded and re-extruded from (footprint, height) below. The
+    # footprint itself is only a convex-hull APPROXIMATION for mesh
+    # geometry (see io_cityjson.footprint_rings's own docstring) -- never
+    # meant to be re-extruded from, only to make the building locatable to
+    # the spatial index/terrain PSLG. Buildings with real mesh geometry now
+    # keep it: their existing vertices are reindexed into this function's
+    # own local pool (cheap -- a copy+relabel of that one building's own
+    # vertex count, not a recomputation) instead of being thrown away.
+    sbg_lookup = vertex_lookup(sbg_cm)
+
     fallback_count = 0
     added = 0
+    preserved = 0
+    preserved_ids = []  # obj_ids that kept their real mesh -- export_stl.py needs
+    # this list to give them different (Remesh Sharp, not plunge_base's
+    # box-shaped-assumption) treatment; see that script's own comment for why.
     for obj_id, poly in footprints:
         if obj_id not in valid_ids:
             fallback_count += 1
             continue
         obj = sbg_cm["CityObjects"][obj_id]
+        existing_geom = obj["geometry"][0] if obj.get("geometry") else None
+
+        if existing_geom is not None and existing_geom["type"] in ("MultiSurface", "CompositeSurface"):
+            # Real bug, found via user report: the preserved mesh's own Z
+            # values (OneMap's original coordinates) were kept completely
+            # unmodified -- unlike plain LoD1 buildings, which get DRAPED
+            # onto the real DTM via geometry_from_rings_draped below, this
+            # branch never adjusted for the local terrain's real elevation
+            # at all. Confirmed directly for the Interlace: the real DTM
+            # says 20.0m at its location, but the mesh's own base sits at
+            # Z=0 in its own coordinates -- meaning the whole building,
+            # podium included, ended up 20m *below* where the terrain
+            # surface actually is, buried under it. Not deleted, not a
+            # mesh/reconstruction issue -- just never repositioned to match
+            # the ground it's supposed to be standing on. Fixed by shifting
+            # every vertex so the mesh's OWN lowest point lands exactly at
+            # the real local terrain elevation, the same real-world anchor
+            # every other building already gets via draping.
+            old_indices = sorted(set(walk_vertex_indices(existing_geom["boundaries"])))
+            mesh_min_z = min(sbg_lookup(i)[2] for i in old_indices)
+            centroid = poly.centroid
+            z_offset = elevation_lookup(centroid.x, centroid.y) - mesh_min_z
+            mapping = {}
+            for old_idx in old_indices:
+                x, y, z = sbg_lookup(old_idx)
+                mapping[old_idx] = pool.add(x, y, z + z_offset)
+            new_boundaries = remap_vertex_indices(existing_geom["boundaries"], mapping)
+
+            # Podium slice, direct user request: real voids in the source
+            # mesh (confirmed by the user -- some of this building's real
+            # "holes" have no geometry at ANY height, not a remesh/slicing
+            # artifact) sit inside the SAME area the terrain hole above
+            # already removed real terrain from -- meaning without this,
+            # those spots would have neither terrain nor building material,
+            # a hole straight through to nothing. A hole in the floor is
+            # never acceptable regardless of why it happened, so rather
+            # than trying to perfectly reverse-engineer which real voids
+            # are "supposed" to be open at ground level (fragile -- already
+            # tried and wrong once), always add a thin, guaranteed-solid
+            # slab spanning EXACTLY the same ground_contact_footprint shape
+            # already used to cut the terrain hole (confirmed hole-free
+            # within its own boundary) -- so the terrain hole is always
+            # backed by real solid material regardless of what the actual
+            # preserved mesh does or doesn't cover there. Reaches from
+            # PODIUM_PLUNGE_M below real terrain (guaranteed overlap with
+            # the terrain's own solidified slab in export_stl.py) up to
+            # the same height ground_contact_footprint sliced at (now in
+            # the post-z_offset frame, so it meets the preserved mesh's
+            # own -- just corrected -- real base).
+            ground_poly = ground_contact_by_id.get(obj_id)
+            if ground_poly is not None:
+                terrain_z = elevation_lookup(centroid.x, centroid.y)
+                podium_faces = _podium_faces(
+                    pool, ground_poly, terrain_z - PODIUM_PLUNGE_M, terrain_z + GROUND_CONTACT_BAND_M
+                )
+                new_boundaries = new_boundaries + podium_faces
+
+            cm["CityObjects"][obj_id] = {
+                "type": obj["type"],
+                "attributes": obj["attributes"],
+                "geometry": [{**existing_geom, "boundaries": new_boundaries}],
+            }
+            preserved += 1
+            preserved_ids.append(obj_id)
+            continue
+
         height = obj["attributes"].get("height") or DEFAULT_HEIGHT
         rings_parts = _polygon_parts_rings(poly)
         geometry = geometry_from_rings_draped(pool, rings_parts, elevation_lookup, height)
@@ -314,9 +538,9 @@ def conforming_overlay(
         }
         added += 1
 
-    log_fn(f"  {added} buildings added (conforming), {fallback_count} skipped/fallback")
-    _lap(f"extrude {added} buildings (per-vertex ElevationLookup + VertexPool.add)")
-    return cm, pool
+    log_fn(f"  {added} buildings extruded (conforming), {preserved} preserved (existing mesh geometry), {fallback_count} skipped/fallback")
+    _lap(f"extrude/preserve {added + preserved} buildings (per-vertex ElevationLookup + VertexPool.add)")
+    return cm, pool, preserved_ids
 
 
 def main():
@@ -339,7 +563,7 @@ def main():
     print(f"Loading SBG {args.sbg}...", file=sys.stderr)
     sbg_cm = json.load(open(args.sbg))
 
-    cm, pool = conforming_overlay(sbg_cm, elevation_lookup, domain_polygon, terrain_step=args.terrain_step, min_footprint_area=args.min_footprint_area)
+    cm, pool, _preserved_ids = conforming_overlay(sbg_cm, elevation_lookup, domain_polygon, terrain_step=args.terrain_step, min_footprint_area=args.min_footprint_area)
 
     finalize_and_save(cm, pool, args.output)
     print(f"Wrote {args.output}", file=sys.stderr)

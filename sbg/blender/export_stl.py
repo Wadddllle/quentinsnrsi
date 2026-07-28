@@ -141,6 +141,7 @@ same process, rather than as a separate earlier stage.
 """
 import bmesh
 import bpy
+import json
 import sys
 import time
 
@@ -150,11 +151,11 @@ def parse_args(argv):
         argv = argv[argv.index("--") + 1:]
     else:
         argv = []
-    args = {"deep_extrude": 30.0, "voxel_size": 2.0, "debris_faces": 100}
+    args = {"deep_extrude": 30.0, "voxel_size": 2.0, "debris_faces": 100, "mesh_ids_file": None}
     i = 0
     while i < len(argv):
         key = argv[i].lstrip("-").replace("-", "_")
-        if key in ("input", "output"):
+        if key in ("input", "output", "mesh_ids_file"):
             args[key] = argv[i + 1]
             i += 2
         elif key in ("deep_extrude", "voxel_size"):
@@ -181,6 +182,14 @@ def clear_scene():
 def plunge_base(obj, drop):
     """Moves every vertex except those at the object's max Z (the flat roof)
     down by `drop` meters, in the object's local mesh data.
+
+    Only correct for a simple flat-roofed LoD1 box extrusion -- "everything
+    except the single highest point" IS "the walls" for a box, but for
+    arbitrary mesh geometry (a dome, e.g.) the single highest point is just
+    the apex, so this would yank basically the entire rest of the curved
+    surface down by `drop`, tearing it apart. See remesh_sharp() below for
+    the real preserved-mesh path -- this function is only ever called on
+    plain footprint-extruded buildings now.
     """
     mesh = obj.data
     zs = [v.co.z for v in mesh.vertices]
@@ -193,6 +202,40 @@ def plunge_base(obj, drop):
             v.co.z -= drop
     bm.to_mesh(mesh)
     bm.free()
+    mesh.update()
+
+
+def remesh_sharp(obj, scale=0.9, sharpness=1.0, threshold=1.0):
+    """Real bug, found via user report: a preserved-mesh building (e.g. a
+    stadium dome from the OneMap review-gate, see conforming_overlay.py's
+    own comment) isn't a simple flat-roofed box -- plunge_base()'s "move
+    everything except the single highest point" logic tears a dome apart
+    instead of safely plunging it, which is why voxel remeshing the whole
+    joined scene produced 2 disconnected pieces instead of 1 (the torn
+    dome couldn't fuse cleanly).
+
+    User tested this directly in Blender's own UI and confirmed it fixes
+    it: apply a Remesh modifier in SHARP mode (not the whole-scene VOXEL
+    mode used later) to this ONE object first. Sharp-mode remesh
+    reconstructs a genuinely closed, watertight surface around the input
+    (unlike plunge_base, it doesn't touch/distort the visible shape, it
+    rebuilds a new closed one) -- confirmed visually: the previously-open
+    underside of the dome came out with a proper solid base, sitting right
+    at the mesh's own real elevation, close enough to the terrain to fuse
+    correctly during the later whole-scene voxel remesh without needing a
+    plunge_base-style deep-extrude at all.
+    """
+    mesh = obj.data
+    depth_guess = 10  # user-tested: 8 left holes in the roof, 10 was the safest
+    mod = obj.modifiers.new(name="remesh_sharp", type="REMESH")
+    mod.mode = "SHARP"
+    mod.octree_depth = depth_guess
+    mod.scale = scale
+    mod.sharpness = sharpness
+    mod.use_remove_disconnected = True
+    mod.threshold = threshold
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.modifier_apply(modifier=mod.name)
     mesh.update()
 
 
@@ -278,8 +321,22 @@ def main():
     print(f"  solid terrain: {len(terrain.data.vertices)} vertices, {len(terrain.data.polygons)} faces", file=sys.stderr)
     _lap("solidify terrain")
 
-    print(f"Plunging building bases by {args['deep_extrude']}m...", file=sys.stderr)
-    for obj in buildings:
+    mesh_ids = set()
+    if args["mesh_ids_file"]:
+        with open(args["mesh_ids_file"]) as f:
+            mesh_ids = set(json.load(f))
+
+    mesh_buildings = [o for o in buildings if o.name in mesh_ids] if mesh_ids else []
+    plunge_buildings = [o for o in buildings if o not in mesh_buildings]
+
+    if mesh_buildings:
+        print(f"Remeshing (Sharp) {len(mesh_buildings)} preserved-mesh building(s)...", file=sys.stderr)
+        for obj in mesh_buildings:
+            remesh_sharp(obj)
+        _lap("remesh sharp (preserved-mesh buildings)")
+
+    print(f"Plunging {len(plunge_buildings)} plain building base(s) by {args['deep_extrude']}m...", file=sys.stderr)
+    for obj in plunge_buildings:
         plunge_base(obj, args["deep_extrude"])
     _lap("plunge building bases")
 

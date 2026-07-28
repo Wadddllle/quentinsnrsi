@@ -6,6 +6,7 @@ Usage: .venv/bin/python -m sbg.onemap.embed
 """
 import json
 import sys
+import uuid
 
 from sbg.config import SBG_OUTPUT
 from sbg.io_cityjson import AppendOnlyVertexPool
@@ -14,10 +15,47 @@ from sbg.onemap.mesh import extract_building_mesh
 
 def mesh_to_multisurface(pool, mesh):
     """Appends every mesh vertex and returns a CityJSON MultiSurface geometry
-    (one triangular ring per face)."""
+    (one triangular ring per face). Tagged lod="3" -- a raw OneMap tile mesh
+    is real per-facade geometry (walls, roof shape, domes), closer to LoD3
+    fidelity than the "2" this was previously (incorrectly) tagged with; a
+    future LoD2-simplification pass can append a second, lower-detail
+    geometry entry alongside this one (CityJSON's `geometry` field is a
+    list for exactly this reason) rather than needing to replace it."""
     local_to_pool_idx = [pool.add(x, y, z) for x, y, z in mesh.vertices]
     boundaries = [[[local_to_pool_idx[i] for i in face]] for face in mesh.faces]
-    return {"type": "MultiSurface", "lod": "2", "boundaries": boundaries}
+    return {"type": "MultiSurface", "lod": "3", "boundaries": boundaries}
+
+
+def embed_mesh_as_new_object(cm, pool, mesh, attributes, building_id=None):
+    """Embeds `mesh` (a trimesh.Trimesh, already in real-world TARGET_CRS
+    coordinates -- caller's job to place/reproject it there) as a brand NEW
+    CityObject, not a replacement of an existing one. Despite living in this
+    OneMap-flavored module, this function itself has nothing OneMap-specific
+    about it -- Phase 4b (add-building) reuses it verbatim for uploaded
+    STL/OBJ meshes, since the embedding step doesn't care whether the mesh
+    came from a fetched OneMap tile or a user's own file. Mirrors
+    replace_with_onemap_mesh's body (mesh_to_multisurface + attribute
+    tagging) but creates a new id instead of overwriting an existing
+    object -- that function's overwrite-in-place is the wrong shape for a
+    pure add.
+    """
+    geometry = mesh_to_multisurface(pool, mesh)
+    obj_id = building_id or f"manual/{uuid.uuid4().hex}"
+    if obj_id in cm["CityObjects"]:
+        raise ValueError(f"CityObject id {obj_id!r} already exists")
+
+    final_attributes = dict(attributes or {})
+    final_attributes.setdefault("height_source", "manual_mesh")
+    final_attributes["mesh_vertex_count"] = len(mesh.vertices)
+    final_attributes["mesh_face_count"] = len(mesh.faces)
+    final_attributes["mesh_watertight"] = bool(mesh.is_watertight)
+
+    cm["CityObjects"][obj_id] = {
+        "type": "Building",
+        "attributes": final_attributes,
+        "geometry": [geometry],
+    }
+    return obj_id
 
 
 def replace_with_onemap_mesh(cm, pool, obj_id, tile_uri, gml_id):

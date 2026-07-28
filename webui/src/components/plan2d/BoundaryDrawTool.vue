@@ -21,9 +21,26 @@ import JobProgressPanel from '../jobs/JobProgressPanel.vue';
 const props = defineProps({
 	footprints: { type: Array, default: () => [] },
 	removedIds: { type: Array, default: () => [] },
+	// Phase 4b Path 1 (hypothetical/parametric add-building): 'boundary' is
+	// the original cutout-drawing behavior, unchanged. 'add-hypothetical'
+	// reuses the exact same point-collection machinery (ring/drawing/
+	// startDrawing/undoPoint/clearAll/manual-entry/rectangle-entry are
+	// already generic "collect a list of (x,y) points," not boundary-
+	// specific despite the component's name) but skips the cutout-preview
+	// debounce (no kept/crossing concept applies to a single new building)
+	// and shows a height/attributes form + "Place building" instead of
+	// Commit/Generate STL.
+	mode: { type: String, default: 'boundary' },
+	// Phase 4b Path 3: forwarded straight through to OrthoWebGLView's own
+	// placeMeshRequest prop -- App.vue owns the { file, note } request, this
+	// component's only job is the upload once OrthoWebGLView confirms a
+	// placement (see onMeshPlacementConfirmed below). Placement lives in 2D
+	// now (not 3D) per direct user feedback -- see OrthoWebGLView.vue's own
+	// comment on why.
+	placeMeshRequest: { type: Object, default: null },
 });
 
-const emit = defineEmits(['committed', 'ring-changed', 'selection-changed', 'view-changed']);
+const emit = defineEmits(['committed', 'ring-changed', 'selection-changed', 'view-changed', 'building-added', 'mesh-placement-done', 'mode-cancelled']);
 
 const viewRef = ref(null);
 
@@ -128,6 +145,7 @@ function finishDrawing() {
 }
 
 function schedulePreview() {
+	if (props.mode !== 'boundary') return; // no kept/crossing concept for a new building
 	if (ring.value.length < 3) {
 		keptIds.value = [];
 		crossingIds.value = [];
@@ -188,6 +206,50 @@ function onViewChanged(bounds) {
 	emit('view-changed', bounds);
 }
 
+// Phase 4b Path 1
+const addHeight = ref(null);
+const addNote = ref('');
+const placing = ref(false);
+const placeError = ref(null);
+
+// Direct user feedback: "if you press draw hypothetical there's really no
+// way to get back to draw boundary without... drawing a building and
+// submitting, or refreshing." Mirrors clearAll() (reset all local drawing
+// state) but also tells the parent to drop add-hypothetical mode entirely,
+// since that flag lives in App.vue, not here.
+function cancelHypothetical() {
+	clearAll();
+	emit('mode-cancelled');
+}
+
+async function placeHypothetical() {
+	if (ring.value.length < 3 || addHeight.value === null || Number.isNaN(addHeight.value) || placing.value) return;
+	placing.value = true;
+	placeError.value = null;
+	try {
+		const res = await fetch('/api/buildings/add', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				footprint: [ring.value],
+				height: addHeight.value,
+				attributes: addNote.value ? { note: addNote.value } : null,
+			}),
+		});
+		const data = await res.json();
+		if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+		emit('building-added', data);
+		ring.value = [];
+		addHeight.value = null;
+		addNote.value = '';
+		emit('ring-changed', ring.value);
+	} catch (err) {
+		placeError.value = err.message;
+	} finally {
+		placing.value = false;
+	}
+}
+
 // STL generation is a deliberately separate, explicit action from
 // commit() above -- commit stays fast/JSON-only (real cutout use is mostly
 // as a record of exactly what was cut, not something scientists directly
@@ -240,6 +302,41 @@ onUnmounted(() => {
 	if (stlPollTimer) clearInterval(stlPollTimer);
 });
 
+// Phase 4b Path 3: OrthoWebGLView owns all the actual ghost-outline/
+// raycasting/rotation interaction (see its own comments) -- this is just
+// the upload once a placement is confirmed, mirroring placeHypothetical's
+// own fetch pattern above.
+const placingMesh = ref(false);
+const placeMeshError = ref(null);
+
+async function onMeshPlacementConfirmed({ file, note, dx, dy, dz, rotationDeg }) {
+	placingMesh.value = true;
+	placeMeshError.value = null;
+	try {
+		const form = new FormData();
+		form.append('file', file);
+		form.append('dx', dx);
+		form.append('dy', dy);
+		form.append('dz', dz);
+		form.append('rotation_deg', rotationDeg);
+		if (note) form.append('attributes', JSON.stringify({ note }));
+		const res = await fetch('/api/buildings/import-mesh', { method: 'POST', body: form });
+		const data = await res.json();
+		if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+		emit('building-added', data);
+	} catch (err) {
+		placeMeshError.value = err.message;
+	} finally {
+		placingMesh.value = false;
+		emit('mesh-placement-done'); // clears App.vue's placeMeshRequest either way -- placement is done, successfully or not
+	}
+}
+
+function onMeshPlacementCancelled(info) {
+	if (info?.error) placeMeshError.value = info.error;
+	emit('mesh-placement-done');
+}
+
 defineExpose({
 	getViewBounds: () => viewRef.value?.getViewBounds(),
 	fitBounds: (...args) => viewRef.value?.fitBounds(...args),
@@ -251,27 +348,41 @@ defineExpose({
 <template>
 	<div class="boundary-draw-tool">
 		<div class="toolbar">
-			<button v-if="!drawing" @click="startDrawing">Draw boundary</button>
+			<button v-if="!drawing" @click="startDrawing">{{ mode === 'add-hypothetical' ? 'Draw footprint' : 'Draw boundary' }}</button>
 			<template v-else>
 				<button @click="finishDrawing">Finish</button>
 				<button @click="undoPoint" :disabled="ring.length === 0">Undo point</button>
 			</template>
 			<button v-if="ring.length" @click="clearAll">Clear</button>
-			<button v-if="ring.length >= 3 && !drawing" :disabled="committing" @click="commit">
-				{{ committing ? 'Committing…' : 'Commit cutout' }}
-			</button>
-			<button
-				v-if="ring.length >= 3 && !drawing"
-				:disabled="stlJob && stlJob.status !== 'done' && stlJob.status !== 'error'"
-				@click="generateStl"
-			>
-				Generate STL
-			</button>
-			<span v-if="stats" class="stats">
-				kept {{ stats.kept }} / crossing {{ stats.crossing }} / area {{ (stats.area_m2 / 1e6).toFixed(3) }} km²
-			</span>
+			<template v-if="mode === 'boundary'">
+				<button v-if="ring.length >= 3 && !drawing" :disabled="committing" @click="commit">
+					{{ committing ? 'Committing…' : 'Commit cutout' }}
+				</button>
+				<button
+					v-if="ring.length >= 3 && !drawing"
+					:disabled="stlJob && stlJob.status !== 'done' && stlJob.status !== 'error'"
+					@click="generateStl"
+				>
+					Generate STL
+				</button>
+				<span v-if="stats" class="stats">
+					kept {{ stats.kept }} / crossing {{ stats.crossing }} / area {{ (stats.area_m2 / 1e6).toFixed(3) }} km²
+				</span>
+				<span v-if="commitResult" class="success">saved {{ commitResult.path }} (kept {{ commitResult.stats.kept }})</span>
+			</template>
+			<template v-else-if="mode === 'add-hypothetical'">
+				<button @click="cancelHypothetical">Cancel / back to boundary</button>
+				<template v-if="ring.length >= 3 && !drawing">
+					<span class="label">Height (m):</span>
+					<input type="number" v-model.number="addHeight" placeholder="height" step="any" min="0" />
+					<input type="text" v-model="addNote" placeholder="note (optional)" class="note-input" />
+					<button :disabled="placing || addHeight === null" @click="placeHypothetical">
+						{{ placing ? 'Placing…' : 'Place building' }}
+					</button>
+				</template>
+			</template>
 			<span v-if="error" class="error">{{ error }}</span>
-			<span v-if="commitResult" class="success">saved {{ commitResult.path }} (kept {{ commitResult.stats.kept }})</span>
+			<span v-if="placeError" class="error">{{ placeError }}</span>
 		</div>
 		<div class="toolbar coords-toolbar">
 			<span class="label">Add point (EPSG:3414):</span>
@@ -293,9 +404,17 @@ defineExpose({
 				:kept-ids="keptIds"
 				:crossing-ids="crossingIds"
 				:removed-ids="removedIds"
+				:place-mesh-request="placeMeshRequest"
 				@click="onCanvasClick"
 				@view-changed="onViewChanged"
+				@mesh-placement-confirmed="onMeshPlacementConfirmed"
+				@mesh-placement-cancelled="onMeshPlacementCancelled"
 			/>
+			<div v-if="placeMeshRequest && !placingMesh" class="placement-hint">
+				Move mouse to position · scroll to rotate · click to place · Esc to cancel
+			</div>
+			<div v-if="placingMesh" class="placement-hint">Uploading…</div>
+			<div v-if="placeMeshError" class="placement-error">{{ placeMeshError }}</div>
 			<div class="warning-overlay">
 				<CrossingBuildingsWarning :crossing-ids="crossingIds" />
 				<JobProgressPanel v-if="stlJob" :job="stlJob" />
@@ -324,6 +443,24 @@ defineExpose({
 }
 .toolbar button {
 	cursor: pointer;
+}
+.toolbar .label {
+	color: #8a97b0;
+}
+.toolbar input {
+	background: #0b1220;
+	color: #ddd;
+	border: 1px solid #3a4358;
+	border-radius: 3px;
+	padding: 2px 5px;
+	font-family: monospace;
+	font-size: 12px;
+}
+.toolbar input[type='number'] {
+	width: 70px;
+}
+.toolbar .note-input {
+	width: 140px;
 }
 .coords-toolbar {
 	background: #141926;
@@ -365,5 +502,30 @@ defineExpose({
 	flex-direction: column;
 	gap: 8px;
 	align-items: flex-end;
+}
+.placement-hint {
+	position: absolute;
+	top: 8px;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 10;
+	background: rgba(11, 18, 32, 0.9);
+	color: #ffb347;
+	border: 1px solid #3a4358;
+	border-radius: 6px;
+	padding: 4px 12px;
+	font-family: monospace;
+	font-size: 12px;
+	white-space: nowrap;
+}
+.placement-error {
+	position: absolute;
+	top: 40px;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 10;
+	color: #ff8080;
+	font-family: monospace;
+	font-size: 12px;
 }
 </style>

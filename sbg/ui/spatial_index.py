@@ -38,13 +38,7 @@ class SpatialIndex:
                 continue
             self.ids.append(obj_id)
             polygons.append(poly)
-            geoms = [poly] if poly.geom_type == "Polygon" else list(poly.geoms)
-            self.footprint_records[obj_id] = {
-                "id": obj_id,
-                "rings": [list(g.exterior.coords) for g in geoms],
-                "height": obj["attributes"].get("height"),
-                "height_source": obj["attributes"].get("height_source"),
-            }
+            self.footprint_records[obj_id] = self._make_record(obj_id, poly, obj)
         self.polygons = polygons
         self.tree = STRtree(polygons)
         # Lets callers go straight from a domain-filtered id list (e.g.
@@ -69,25 +63,98 @@ class SpatialIndex:
         # removed id reaching it would KeyError -- this filtering is what
         # guarantees that never happens.
         #
-        # Adding a NEW footprint (Phase 4) can't use this same trick, since
-        # exclusion can't make something findable that was never in the
-        # tree -- flagged as a real Phase 4 extension point, not solved here.
+        # Adding a NEW footprint can't use this same trick, since exclusion
+        # can't make something findable that was never in the tree -- Phase
+        # 4b (add-building) solves this with pending_additions below: a
+        # small, linear-scanned dict of polygons alongside the immutable
+        # STRtree, tested with the same shapely predicate the tree query
+        # already uses. Cheap as long as the number of adds in a session
+        # stays small (dozens, not thousands) -- no cap/consolidation into a
+        # real rebuilt tree yet, a known cliff, not solved now (matches the
+        # same tradeoff already accepted for removed_ids at Phase 3).
         self.removed_ids = set()
+        self.pending_additions = {}
+        # For active_count below -- O(1) membership test to tell "removed an
+        # original building" apart from "removed a same-session addition"
+        # (see mark_removed's own comment for why that distinction matters).
+        self._ids_set = set(self.ids)
+
+    def _make_record(self, obj_id, poly, obj):
+        geoms = [poly] if poly.geom_type == "Polygon" else list(poly.geoms)
+        return {
+            "id": obj_id,
+            "rings": [list(g.exterior.coords) for g in geoms],
+            "height": obj["attributes"].get("height"),
+            "height_source": obj["attributes"].get("height_source"),
+        }
 
     def mark_removed(self, obj_id):
         self.removed_ids.add(obj_id)
+        # Real bug, found via a user report (KeyError in subset_cityjson):
+        # removing a building added earlier THIS session left it in BOTH
+        # removed_ids and pending_additions -- every query method's
+        # pending_additions merge (query_intersects_bbox etc.) doesn't itself
+        # check removed_ids, so the dead id kept coming back out of queries
+        # and reaching cm["CityObjects"][obj_id] after it had already been
+        # deleted. Popping it here (instead of only adding to removed_ids)
+        # keeps "removed_ids wins" a real invariant instead of one that only
+        # holds for buildings that existed at startup.
+        self.pending_additions.pop(obj_id, None)
 
     def mark_restored(self, obj_id):
         self.removed_ids.discard(obj_id)
+        # Mirror of the mark_removed fix above: undoing the removal of a
+        # same-session addition needs to put it back in pending_additions
+        # too, not just clear removed_ids -- otherwise it becomes invisible
+        # to every query method again even though cm["CityObjects"] genuinely
+        # has it back. mark_added() already does exactly this derivation.
+        if obj_id not in self._ids_set:
+            self.mark_added(obj_id)
+
+    def mark_added(self, obj_id):
+        """Call after inserting obj_id into cm["CityObjects"] -- derives its
+        polygon/record directly from self.cm (already-updated by the
+        caller), same as __init__ does for every building at startup.
+        """
+        obj = self.cm["CityObjects"][obj_id]
+        poly = building_footprint_polygon(self.cm, obj)
+        if poly is None:
+            return
+        self.pending_additions[obj_id] = poly
+        self.footprint_records[obj_id] = self._make_record(obj_id, poly, obj)
+        # Real bug, user report: polygon_by_id is otherwise only ever built
+        # once at __init__ from the startup dataset -- a same-session
+        # addition (e.g. a fresh OneMap replacement) was findable via
+        # query_contained() (which merges in pending_additions) but then
+        # KeyError'd the instant a caller (conforming_overlay, for the STL
+        # pipeline) tried to actually look up its polygon here. Keeping this
+        # in sync is what query_contained()'s own callers assume already
+        # holds.
+        self.polygon_by_id[obj_id] = poly
+
+    def mark_add_undone(self, obj_id):
+        self.pending_additions.pop(obj_id, None)
+        self.footprint_records.pop(obj_id, None)
+        self.polygon_by_id.pop(obj_id, None)
 
     @property
     def active_count(self):
-        return len(self.ids) - len(self.removed_ids)
+        # removed_ids can now contain ids that were never in self.ids (a
+        # same-session addition that got removed -- see mark_removed) --
+        # only ids that are BOTH removed and part of the original startup
+        # index should count against len(self.ids); pending_additions is
+        # already exactly "currently active" (mark_removed pops from it),
+        # so it needs no equivalent filtering.
+        removed_originals = len(self.removed_ids & self._ids_set)
+        return len(self.ids) - removed_originals + len(self.pending_additions)
 
     def query_intersects_bbox(self, xmin, ymin, xmax, ymax):
         """Ids of buildings whose footprint intersects the bbox (for viewport-scoped fetches)."""
-        idxs = self.tree.query(box(xmin, ymin, xmax, ymax), predicate="intersects")
-        return [self.ids[i] for i in idxs if self.ids[i] not in self.removed_ids]
+        domain = box(xmin, ymin, xmax, ymax)
+        idxs = self.tree.query(domain, predicate="intersects")
+        result = [self.ids[i] for i in idxs if self.ids[i] not in self.removed_ids]
+        result += [oid for oid, poly in self.pending_additions.items() if domain.intersects(poly)]
+        return result
 
     def query_contained(self, domain_polygon):
         """Ids of buildings whose footprint is fully contained in domain_polygon
@@ -96,7 +163,9 @@ class SpatialIndex:
         extent check).
         """
         idxs = self.tree.query(domain_polygon, predicate="contains")
-        return [self.ids[i] for i in idxs if self.ids[i] not in self.removed_ids]
+        result = [self.ids[i] for i in idxs if self.ids[i] not in self.removed_ids]
+        result += [oid for oid, poly in self.pending_additions.items() if domain_polygon.contains(poly)]
+        return result
 
     def query_intersects_not_contained(self, domain_polygon):
         """Ids of buildings that cross the domain boundary (intersect but
@@ -106,7 +175,12 @@ class SpatialIndex:
         """
         contained = set(self.query_contained(domain_polygon))
         idxs = self.tree.query(domain_polygon, predicate="intersects")
-        return [self.ids[i] for i in idxs if self.ids[i] not in contained and self.ids[i] not in self.removed_ids]
+        result = [self.ids[i] for i in idxs if self.ids[i] not in contained and self.ids[i] not in self.removed_ids]
+        result += [
+            oid for oid, poly in self.pending_additions.items()
+            if oid not in contained and domain_polygon.intersects(poly)
+        ]
+        return result
 
 
 def build_index(cm):

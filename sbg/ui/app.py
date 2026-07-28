@@ -20,7 +20,7 @@ from sbg.config import DATA_DIR, SBG_OUTPUT
 from sbg.io_cityjson import subset_cityjson
 from sbg.topo.island_terrain import build_masked_island_grid, pack_terrain_binary
 from sbg.ui import versioning
-from sbg.ui.routers import buildings, cutout, dataset, onemap, pipeline, session as session_router, versions
+from sbg.ui.routers import attributes, buildings, cutout, dataset, onemap, onemap_review, pipeline, session as session_router, versions
 from sbg.ui.session import Session
 from sbg.ui.spatial_index import build_index
 
@@ -118,8 +118,10 @@ def create_app(dev: bool = False, dataset_path=None) -> FastAPI:
     app.include_router(dataset.router)
     app.include_router(cutout.router)
     app.include_router(onemap.router)
+    app.include_router(onemap_review.router)
     app.include_router(pipeline.router)
     app.include_router(buildings.router)
+    app.include_router(attributes.router)
     app.include_router(session_router.router)
     app.include_router(versions.router)
 

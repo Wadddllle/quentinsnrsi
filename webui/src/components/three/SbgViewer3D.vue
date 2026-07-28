@@ -1,5 +1,5 @@
 <script setup>
-import { ref, shallowRef, computed, onMounted } from 'vue';
+import { ref, shallowRef, computed, onMounted, watch } from 'vue';
 import * as THREE from 'three';
 import ThreeJsViewer from './ThreeJsViewer.vue';
 import { getFullIslandCitymodel } from '../../composables/fullIslandData.js';
@@ -41,9 +41,40 @@ const props = defineProps({
 	// clicked id (from the @object_clicked event) but was only using it for
 	// the status-bar text, not passing it back down.
 	selectedObjid: { type: String, default: null },
+	// Phase 4a (metadata editing): the last mutation App.vue's global Undo
+	// button reversed, so an edited-attributes override for that building
+	// (if any) can be cleared -- see attributeOverrides below.
+	lastUndone: { type: Object, default: null },
+	// Phase 4b (add-building): footprint+height records for buildings added
+	// this session -- only the ids are actually used here (see
+	// addedCitymodel below, which fetches each id's REAL geometry rather
+	// than approximating it from the footprint+height record itself).
+	// Placement UI moved to 2D (OrthoWebGLView) -- see its own comments for
+	// why (no real use for a Z axis, camera-orbit fighting with ghost-
+	// follow, and "press add before the real mesh has rendered" were all
+	// real problems with the original 3D ghost-preview flow).
+	addedFootprints: { type: Array, default: () => [] },
+	// Phase 4c (OneMap review-gate): straight passthrough to ThreeJsViewer,
+	// no fetch/state logic needed here -- unlike addedCitymodel above,
+	// OneMapReviewPanel.vue already owns the proposal state (it knows
+	// exactly when to fetch/refetch, e.g. after a nudge) and hands the
+	// resulting mini-citymodel down through App.vue as a plain prop.
+	reviewOldFootprintRings: { type: Array, default: () => [] },
+	reviewCitymodel: { type: Object, default: null },
+	// Phase 4c pooling: whether a OneMap replacement is currently open for
+	// review -- when true, the info-panel offers "Add to current OneMap
+	// replacement" for whatever's selected, alongside Remove/Replace.
+	oneMapProposalActive: { type: Boolean, default: false },
+	// Real per-object hide/dim shader mechanism (see ThreeJsViewer.vue's
+	// own comment) -- straight passthrough, same as reviewOldFootprintRings
+	// above, no fetch/state logic needed here.
+	removedIds: { type: Array, default: () => [] },
+	reviewOldBuildingIds: { type: Array, default: () => [] },
+	showIslandTerrain: { type: Boolean, default: true },
+	editedIds: { type: Array, default: () => [] },
 });
 
-const emit = defineEmits(['object_clicked', 'loaded', 'error', 'building_removed']);
+const emit = defineEmits(['object_clicked', 'loaded', 'error', 'building_removed', 'attributes_edited', 'replace_with_onemap', 'add_to_onemap_replacement', 'height_edited']);
 
 const viewerRef = ref(null);
 const citymodel = shallowRef({});
@@ -146,10 +177,128 @@ function resetView() {
 // needed to show them. Previously that objid only ever reached the status
 // bar as a bare id string, which is useless without the source JSON open
 // next to it -- direct user complaint this addresses.
+// Phase 4a (metadata editing): a small local override map, NOT stored on
+// citymodel -- citymodel is a shallowRef, always reassigned wholesale, and
+// ThreeJsViewer's citymodel watcher does a full expensive teardown+reload
+// on ANY reassignment (see the file-top comment on localFrameOffset/the
+// project plan's own writeup on this exact trap). Reassigning citymodel.value
+// just to reflect one edited attribute would trigger that same full reload
+// for a one-field edit -- attributeOverrides is deliberately a separate,
+// small, plain ref instead (only ever holds entries for buildings actually
+// edited this session, dozens at most, so normal deep reactivity here is
+// cheap and safe, unlike the 118k-building CityJSON graph).
+const attributeOverrides = ref({});
+
 const selectedAttributes = computed(() => {
 	if (!props.selectedObjid) return null;
-	return citymodel.value.CityObjects?.[props.selectedObjid]?.attributes ?? null;
+	const base = citymodel.value.CityObjects?.[props.selectedObjid]?.attributes;
+	if (!base) return null;
+	return { ...base, ...(attributeOverrides.value[props.selectedObjid] ?? {}) };
 });
+
+// Real bug found via user report: clicking the OneMap review overlay's
+// proposed mesh (a real, if unusual, thing to do -- "sometimes you need to
+// click it to see how big it is") resolves selectedObjid to a synthetic id
+// like "proposal/<gml_id>" (see build_preview_citymodel) that doesn't exist
+// in the main citymodel -- selectedAttributes above correctly returns null
+// for it, but the OLD template gated the entire .info-panel (including the
+// "Add to current OneMap replacement" pool button) on selectedAttributes
+// being truthy, so clicking the overlay made the whole panel vanish. That's
+// exactly the flow a user pooling multiple buildings hits: click the
+// proposed mesh to gauge its size, then look for the pool button and find
+// no panel at all. Same applies to Phase 4b's added-buildings overlay.
+// This computed identifies which overlay (if any) the id belongs to, purely
+// so the panel can show a small, honest "not a real building yet" message
+// instead of disappearing -- selectedAttributes itself (and therefore
+// Remove/Replace/pool, all of which need a REAL building) is untouched.
+const selectedOverlaySource = computed(() => {
+	if (!props.selectedObjid || selectedAttributes.value) return null;
+	if (props.reviewCitymodel?.CityObjects?.[props.selectedObjid]) return 'review';
+	if (addedCitymodel.value?.CityObjects?.[props.selectedObjid]) return 'added';
+	return null;
+});
+
+watch(
+	() => props.lastUndone,
+	(entry) => {
+		if (!entry?.building_id) return;
+		if (entry.op !== 'edit_attributes' && entry.op !== 'edit_height') return;
+		if (!(entry.building_id in attributeOverrides.value)) return;
+		const next = { ...attributeOverrides.value };
+		delete next[entry.building_id];
+		attributeOverrides.value = next;
+	}
+);
+
+// Fields a real geometry-mutating operation (remove/add, later the OneMap
+// review-gate) is responsible for keeping in sync with actual geometry --
+// mirrors sbg/ui/routers/attributes.py's own _BLOCKLIST exactly. Enforced
+// server-side too (400 if sent); kept here as well so the edit UI never
+// even offers to change them, rather than relying on a round-trip failure.
+const ATTRIBUTE_BLOCKLIST = new Set([
+	'height', 'height_source', 'mesh_vertex_count', 'mesh_face_count',
+	'mesh_watertight', 'onemap_gml_id', 'onemap_storeys', 'onemap_name',
+]);
+
+const editingAttrs = ref(false);
+const editValues = ref({});
+const savingAttrs = ref(false);
+const attrsError = ref(null);
+
+function startEditAttrs() {
+	if (!selectedAttributes.value) return;
+	editValues.value = { ...selectedAttributes.value };
+	attrsError.value = null;
+	editingAttrs.value = true;
+}
+
+function cancelEditAttrs() {
+	editingAttrs.value = false;
+	attrsError.value = null;
+}
+
+watch(
+	() => props.selectedObjid,
+	() => {
+		editingAttrs.value = false;
+		attrsError.value = null;
+	}
+);
+
+async function saveEditAttrs() {
+	if (!props.selectedObjid || savingAttrs.value) return;
+	const base = selectedAttributes.value ?? {};
+	const changed = {};
+	for (const key of Object.keys(editValues.value)) {
+		if (ATTRIBUTE_BLOCKLIST.has(key)) continue;
+		if (editValues.value[key] !== base[key]) changed[key] = editValues.value[key];
+	}
+	if (Object.keys(changed).length === 0) {
+		editingAttrs.value = false;
+		return;
+	}
+	savingAttrs.value = true;
+	attrsError.value = null;
+	try {
+		const res = await fetch(`/api/buildings/${props.selectedObjid}/attributes`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ attributes: changed }),
+		});
+		const data = await res.json();
+		if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+		attributeOverrides.value = {
+			...attributeOverrides.value,
+			[props.selectedObjid]: { ...(attributeOverrides.value[props.selectedObjid] ?? {}), ...changed },
+		};
+		editingAttrs.value = false;
+		emit('attributes_edited', { id: props.selectedObjid, session: data.session });
+	} catch (err) {
+		attrsError.value = err.message;
+	} finally {
+		savingAttrs.value = false;
+	}
+}
 
 // Phase 3 (remove-building): the info panel already resolves a real,
 // existing CityObject id (see selectedAttributes above) -- Remove reuses
@@ -178,6 +327,112 @@ async function removeSelected() {
 	}
 }
 
+// Direct user request: "only rare weird cases are absurdly wrong, like
+// Marina Bay Sands" -- OneMap backfill occasionally assigns a tower's real
+// neighbor's height (see sbg/onemap/backfill.py's own honest ~9.5%-
+// ambiguous-match finding). LoD1/extruded only, matching the backend's own
+// authoritative check -- height_source==='onemap_mesh' is this project's
+// established signal for "real mesh geometry, no single roof height to
+// move" (every other code path that produces MultiSurface geometry tags
+// this exact value). This is a client-side pre-filter for a clean UI only;
+// the backend rejects non-Solid geometry regardless.
+const canEditHeight = computed(() => selectedAttributes.value && selectedAttributes.value.height_source !== 'onemap_mesh');
+const editingHeight = ref(false);
+const heightInputValue = ref(null);
+const savingHeight = ref(false);
+const heightError = ref(null);
+
+function startEditHeight() {
+	if (!selectedAttributes.value) return;
+	heightInputValue.value = selectedAttributes.value.height;
+	heightError.value = null;
+	editingHeight.value = true;
+}
+
+function cancelEditHeight() {
+	editingHeight.value = false;
+	heightError.value = null;
+}
+
+watch(
+	() => props.selectedObjid,
+	() => {
+		editingHeight.value = false;
+		heightError.value = null;
+	}
+);
+
+async function saveEditHeight() {
+	if (!props.selectedObjid || savingHeight.value) return;
+	const h = Number(heightInputValue.value);
+	if (!Number.isFinite(h) || h <= 0) {
+		heightError.value = 'Height must be a positive number';
+		return;
+	}
+	savingHeight.value = true;
+	heightError.value = null;
+	try {
+		const res = await fetch(`/api/buildings/${props.selectedObjid}/height`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ height: h }),
+		});
+		const data = await res.json();
+		if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+		// Same reason attribute edits use attributeOverrides instead of
+		// touching citymodel directly (see its own comment) -- real bug
+		// found via testing: without this, the backend edit genuinely
+		// succeeded (session count went up, 3D geometry updated via the
+		// overlay) but the info panel kept showing the OLD height, since
+		// selectedAttributes reads from the never-reloaded shared citymodel.
+		attributeOverrides.value = {
+			...attributeOverrides.value,
+			[props.selectedObjid]: { ...(attributeOverrides.value[props.selectedObjid] ?? {}), height: h, height_source: 'manual' },
+		};
+		editingHeight.value = false;
+		emit('height_edited', { id: props.selectedObjid, footprint: data.footprint, session: data.session });
+	} catch (err) {
+		heightError.value = err.message;
+	} finally {
+		savingHeight.value = false;
+	}
+}
+
+// Phase 4b (add-building): real geometry for the 3D overlay, fetched from
+// /api/buildings/geometry rather than approximated client-side (see
+// ThreeJsViewer.vue's own comment on why an earlier box-extrusion version
+// was wrong for Path 2/3). Refetches the WHOLE current added-id set on any
+// change (add or undo) instead of trying to incrementally merge vertex
+// pools across separate fetches -- simple, and cheap at the "dozens, not
+// thousands" scale this overlay is meant for (same tradeoff already
+// accepted for SpatialIndex.pending_additions). Skipped if the id set is
+// unchanged (e.g. an unrelated prop reactivity tick) via a plain sorted-
+// join key comparison.
+const addedCitymodel = shallowRef(null);
+let lastAddedIdsKey = '';
+
+watch(
+	() => props.addedFootprints.map((r) => r.id),
+	async (ids) => {
+		const key = [...ids].sort().join(',');
+		if (key === lastAddedIdsKey) return;
+		lastAddedIdsKey = key;
+		if (ids.length === 0) {
+			addedCitymodel.value = null;
+			return;
+		}
+		try {
+			const qs = new URLSearchParams({ ids: ids.join(',') });
+			const res = await fetch(`/api/buildings/geometry?${qs}`);
+			if (!res.ok) return;
+			addedCitymodel.value = await res.json();
+		} catch {
+			// leave the previous overlay state as-is -- the next add/undo will retry
+		}
+	},
+	{ immediate: true }
+);
+
 defineExpose({ goTo, resetView });
 </script>
 
@@ -189,6 +444,13 @@ defineExpose({ goTo, resetView });
 			:selected-objid="selectedObjid"
 			:boundary-ring="boundaryRing"
 			:highlight-footprint-rings="highlightFootprintRings"
+			:added-citymodel="addedCitymodel"
+			:review-old-footprint-rings="reviewOldFootprintRings"
+			:review-citymodel="reviewCitymodel"
+			:removed-ids="removedIds"
+			:review-old-building-ids="reviewOldBuildingIds"
+			:show-island-terrain="showIslandTerrain"
+			:edited-ids="editedIds"
 			@object_clicked="onObjectClicked"
 			@rendering="onRendering"
 			@chunkLoaded="onChunkLoaded"
@@ -198,19 +460,78 @@ defineExpose({ goTo, resetView });
 			<span v-else>rendering… ({{ chunkProgress }} / ~{{ chunkEstimateTotal }} chunks)</span>
 		</div>
 		<div v-if="selectedAttributes" class="info-panel">
-			<div class="info-panel-header">{{ selectedObjid }}</div>
+			<div class="info-panel-header-row">
+				<div class="info-panel-header">{{ selectedObjid }}</div>
+				<button v-if="!editingAttrs" class="edit-toggle-btn" @click="startEditAttrs">Edit</button>
+			</div>
 			<table>
 				<tbody>
 					<tr v-for="(value, key) in selectedAttributes" :key="key">
 						<td class="k">{{ key }}</td>
-						<td class="v">{{ value === null || value === '' ? '—' : value }}</td>
+						<td class="v" v-if="!editingAttrs">{{ value === null || value === '' ? '—' : value }}</td>
+						<td class="v" v-else>
+							<input
+								v-if="!ATTRIBUTE_BLOCKLIST.has(key)"
+								v-model="editValues[key]"
+								class="attr-input"
+							/>
+							<span v-else class="attr-locked" :title="'Geometry-linked, edit via Remove/Replace instead'">{{ value === null || value === '' ? '—' : value }}</span>
+						</td>
 					</tr>
 				</tbody>
 			</table>
-			<button class="remove-btn" :disabled="removing" @click="removeSelected">
-				{{ removing ? 'Removing…' : 'Remove building' }}
+			<div v-if="editingAttrs" class="edit-actions">
+				<button class="save-attrs-btn" :disabled="savingAttrs" @click="saveEditAttrs">
+					{{ savingAttrs ? 'Saving…' : 'Save changes' }}
+				</button>
+				<button class="cancel-attrs-btn" :disabled="savingAttrs" @click="cancelEditAttrs">Cancel</button>
+			</div>
+			<div v-if="attrsError" class="remove-error">{{ attrsError }}</div>
+			<div v-if="!editingAttrs && canEditHeight" class="height-edit-row">
+				<template v-if="!editingHeight">
+					<button class="fix-height-btn" @click="startEditHeight">Fix height…</button>
+				</template>
+				<template v-else>
+					<input type="number" v-model.number="heightInputValue" class="attr-input height-input" step="any" min="0" />
+					<button class="save-attrs-btn" :disabled="savingHeight" @click="saveEditHeight">
+						{{ savingHeight ? 'Saving…' : 'Save' }}
+					</button>
+					<button class="cancel-attrs-btn" :disabled="savingHeight" @click="cancelEditHeight">Cancel</button>
+				</template>
+				<div v-if="heightError" class="remove-error">{{ heightError }}</div>
+			</div>
+			<div v-if="!editingAttrs" class="info-panel-actions">
+				<button class="remove-btn" :disabled="removing" @click="removeSelected">
+					{{ removing ? 'Removing…' : 'Remove building' }}
+				</button>
+				<button class="onemap-btn" @click="emit('replace_with_onemap', { buildingId: selectedObjid })">
+					Replace with OneMap…
+				</button>
+			</div>
+			<button
+				v-if="!editingAttrs && oneMapProposalActive"
+				class="onemap-btn pool-btn"
+				@click="emit('add_to_onemap_replacement', { buildingId: selectedObjid })"
+			>
+				Add to current OneMap replacement
 			</button>
 			<div v-if="removeError" class="remove-error">{{ removeError }}</div>
+		</div>
+		<!-- Real bug fix: clicking the OneMap review overlay's proposed mesh
+		     (or a same-session added-building overlay) used to make the WHOLE
+		     info panel vanish, including the pool button, since selectedAttributes
+		     is only ever non-null for a REAL main-citymodel building -- see
+		     selectedOverlaySource's own comment. This isn't a real building, so
+		     no Remove/Replace/pool actions apply, but a click that lands here was
+		     deliberate (checking the proposed mesh's extent), so it gets honest
+		     feedback instead of nothing. -->
+		<div v-else-if="selectedOverlaySource" class="info-panel">
+			<div class="info-panel-header-row">
+				<div class="info-panel-header">{{ selectedObjid }}</div>
+			</div>
+			<div class="hint">
+				{{ selectedOverlaySource === 'review' ? 'Proposed OneMap mesh (not yet approved) -- click a real building nearby to pool it into this replacement.' : 'A building added this session.' }}
+			</div>
 		</div>
 	</div>
 </template>
@@ -234,8 +555,17 @@ defineExpose({ goTo, resetView });
 	font-size: 12px;
 }
 .info-panel {
+	/* Real bug, user report: this used to dock top-right, same corner as
+	   OneMapReviewPanel.vue/VersionHistoryPanel.vue (both also top:44px;
+	   right:8px). Those sit at a higher z-index, so whenever either was
+	   open, this panel rendered fully underneath it -- completely hidden,
+	   not merely visually competing. That's exactly the situation pooling
+	   requires (review panel open + a building selected), so the
+	   "Add to current OneMap replacement" button was never actually visible.
+	   Bottom-right instead -- doesn't collide with anything else docked in
+	   this view (loading-badge is bottom-LEFT). */
 	position: absolute;
-	top: 8px;
+	bottom: 8px;
 	right: 8px;
 	z-index: 10;
 	background: rgba(11, 18, 32, 0.92);
@@ -249,11 +579,92 @@ defineExpose({ goTo, resetView });
 	max-height: 70vh;
 	overflow-y: auto;
 }
+.info-panel-header-row {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 8px;
+	margin-bottom: 6px;
+}
 .info-panel-header {
 	font-weight: bold;
 	color: #4a9eff;
-	margin-bottom: 6px;
 	word-break: break-all;
+}
+.hint {
+	color: #8a97ad;
+	font-size: 12px;
+}
+.edit-toggle-btn {
+	flex-shrink: 0;
+	cursor: pointer;
+	padding: 2px 8px;
+	background: #262e42;
+	color: #ddd;
+	border: 1px solid #3a4358;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 11px;
+}
+.attr-input {
+	width: 100%;
+	box-sizing: border-box;
+	padding: 1px 4px;
+	background: #0b1220;
+	color: #ddd;
+	border: 1px solid #3a4358;
+	border-radius: 3px;
+	font-family: monospace;
+	font-size: 12px;
+}
+.attr-locked {
+	color: #5a6478;
+}
+.edit-actions {
+	margin-top: 8px;
+	display: flex;
+	gap: 6px;
+}
+.save-attrs-btn,
+.cancel-attrs-btn {
+	flex: 1;
+	cursor: pointer;
+	padding: 4px 10px;
+	background: #262e42;
+	color: #ddd;
+	border: 1px solid #3a4358;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 12px;
+}
+.save-attrs-btn:disabled,
+.cancel-attrs-btn:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+.save-attrs-btn:hover:not(:disabled) {
+	background: #1f3a2e;
+}
+.height-edit-row {
+	margin-top: 6px;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+.fix-height-btn {
+	cursor: pointer;
+	padding: 3px 8px;
+	background: #262e42;
+	color: #ffb347;
+	border: 1px solid #7a5a2e;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 11px;
+}
+.height-input {
+	width: 80px;
+	flex: none;
 }
 .info-panel table {
 	border-collapse: collapse;
@@ -271,9 +682,13 @@ defineExpose({ goTo, resetView });
 .info-panel td.v {
 	word-break: break-word;
 }
-.remove-btn {
+.info-panel-actions {
 	margin-top: 8px;
-	width: 100%;
+	display: flex;
+	gap: 6px;
+}
+.remove-btn {
+	flex: 1;
 	cursor: pointer;
 	padding: 4px 10px;
 	background: #4a1f24;
@@ -289,6 +704,24 @@ defineExpose({ goTo, resetView });
 }
 .remove-btn:hover:not(:disabled) {
 	background: #5c262d;
+}
+.onemap-btn {
+	flex: 1;
+	cursor: pointer;
+	padding: 4px 10px;
+	background: #1f2e4a;
+	color: #9fd4ff;
+	border: 1px solid #2e4a7a;
+	border-radius: 4px;
+	font-family: monospace;
+	font-size: 12px;
+}
+.onemap-btn:hover {
+	background: #263a5c;
+}
+.pool-btn {
+	margin-top: 6px;
+	width: 100%;
 }
 .remove-error {
 	margin-top: 4px;

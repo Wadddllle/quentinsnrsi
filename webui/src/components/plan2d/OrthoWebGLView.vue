@@ -19,6 +19,17 @@ import { MapControls } from 'three/examples/jsm/controls/MapControls.js';
 import { Line2 } from 'three/examples/jsm/lines/Line2.js';
 import { LineGeometry } from 'three/examples/jsm/lines/LineGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+// Phase 4b Path 3 (mesh import placement): client-side parse of an uploaded
+// STL/OBJ, purely to derive a 2D preview outline -- the backend does its own
+// authoritative parse (via trimesh) once placement is confirmed, this is
+// never uploaded, just rendered. Moved here from ThreeJsViewer.vue (the
+// original 3D ghost-preview flow) per direct user feedback: there's no real
+// use for a Z axis when placing a footprint, and orbiting/panning the 3D
+// camera while a ghost is active fought the interaction badly. Placement is
+// 2D-only now, matching how the boundary-drawing tool already works.
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 const props = defineProps({
 	footprints: { type: Array, default: () => [] },
@@ -29,9 +40,14 @@ const props = defineProps({
 	// reuses the exact same delta-recolor mechanism already built for
 	// keptIds/crossingIds below, just a third paintable state.
 	removedIds: { type: Array, default: () => [] },
+	// Phase 4b Path 3: set to { file, note } to start interactive placement
+	// (mousemove-follow + scroll-to-rotate + click-to-confirm), null/
+	// undefined otherwise -- a prop rather than a method call so the parent
+	// can reactively clear it (e.g. Escape/cancel) without needing a ref.
+	placeMeshRequest: { type: Object, default: null },
 });
 
-const emit = defineEmits(['click', 'view-changed']);
+const emit = defineEmits(['click', 'view-changed', 'mesh-placement-confirmed', 'mesh-placement-cancelled']);
 
 const containerRef = ref(null);
 let renderer, scene, camera, controls, mesh, colorAttr;
@@ -40,6 +56,19 @@ let hasAutoFitted = false;
 let fullExtentBounds = null; // {xmin,ymin,xmax,ymax} of all loaded footprints, for resetView()
 let ringLine = null;
 let boundaryOnly = false; // true while a drag gesture is in progress on controls -- avoids fighting MapControls' own render loop
+
+// Phase 4b Path 3 (mesh import placement) -- see placeMeshRequest prop
+// comment above for why this lives here (2D) rather than the 3D view.
+let ghostGroup = null; // THREE.Group holding the fill + outline, moved/rotated as a unit
+let ghostRawCentroidXY = null; // hull's own XY centroid, before recentering -- needed to compute dx/dy on confirm
+let ghostRawMinZ = null; // raw mesh's min Z -- dz places the mesh's own base at world Z=0, matching Path 1's flat base_z=0.0 default
+let ghostRotationDeg = 0;
+let ghostSourceRequest = null;
+let controlsWereEnabled = true;
+let placementMoveHandler = null;
+let placementWheelHandler = null;
+let placementClickHandler = null;
+let placementKeyHandler = null;
 
 const DEFAULT_COLOR = [150 / 255, 160 / 255, 180 / 255];
 const KEPT_COLOR = [74 / 255, 158 / 255, 255 / 255];
@@ -263,11 +292,7 @@ function getViewBounds() {
 	return { xmin: cx - w / 2, ymin: cy - h / 2, xmax: cx + w / 2, ymax: cy + h / 2 };
 }
 
-function onPointerUp(evt) {
-	// MapControls consumes drag gestures itself; a plain click (no drag) is
-	// what should register as a boundary-point placement. MapControls
-	// doesn't distinguish for us, so track movement ourselves.
-	if (evt.__wasDrag) return;
+function screenToWorld(evt) {
 	const el = containerRef.value;
 	const rect = el.getBoundingClientRect();
 	const ndc = new THREE.Vector2(
@@ -278,9 +303,23 @@ function onPointerUp(evt) {
 	raycaster.setFromCamera(ndc, camera);
 	const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
 	const hit = new THREE.Vector3();
-	if (raycaster.ray.intersectPlane(groundPlane, hit)) {
-		emit('click', [hit.x, hit.y]);
-	}
+	return raycaster.ray.intersectPlane(groundPlane, hit) ? hit : null;
+}
+
+function onPointerUp(evt) {
+	// Suppress boundary-point placement while a mesh-placement ghost is
+	// active -- both this (via pointerup) and _onGhostClick (via a separate
+	// 'click' listener) fire for the same physical click on the same DOM
+	// element, and confirming a placement shouldn't also add a boundary
+	// point (the exact cross-firing bug already found and fixed once for
+	// the original 3D ghost flow -- same fix, same reason, new location).
+	if (ghostGroup) return;
+	// MapControls consumes drag gestures itself; a plain click (no drag) is
+	// what should register as a boundary-point placement. MapControls
+	// doesn't distinguish for us, so track movement ourselves.
+	if (evt.__wasDrag) return;
+	const hit = screenToWorld(evt);
+	if (hit) emit('click', [hit.x, hit.y]);
 }
 
 let downX = 0, downY = 0;
@@ -290,6 +329,210 @@ function onPointerUpWithDragCheck(evt) {
 	evt.__wasDrag = moved;
 	onPointerUp(evt);
 }
+
+// --- Phase 4b Path 3: mesh-import placement -------------------------------
+
+function convexHull2D(points) {
+	// Andrew's monotone chain -- a cheap, dependency-free way to turn a raw
+	// mesh's vertices into a top-down outline for the ghost preview. Not an
+	// exact silhouette for a concave building, but a real, honest outline
+	// (not a bounding box) that's good enough for "does this look about
+	// right" placement, matching how the added-buildings 3D overlay is also
+	// only ever an approximation (see ThreeJsViewer.vue's own comment).
+	const pts = [...new Set(points.map((p) => p.join(',')))].map((s) => s.split(',').map(Number));
+	pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+	if (pts.length < 3) return pts;
+	const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+	const lower = [];
+	for (const p of pts) {
+		while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+		lower.push(p);
+	}
+	const upper = [];
+	for (let i = pts.length - 1; i >= 0; i--) {
+		const p = pts[i];
+		while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+		upper.push(p);
+	}
+	lower.pop();
+	upper.pop();
+	return lower.concat(upper);
+}
+
+async function parseMeshFile(file) {
+	const ext = file.name.split('.').pop().toLowerCase();
+	if (ext === 'obj') {
+		const text = await file.text();
+		const group = new OBJLoader().parse(text);
+		const geometries = [];
+		group.traverse((child) => {
+			if (child.isMesh && child.geometry) {
+				geometries.push(child.geometry.index ? child.geometry.toNonIndexed() : child.geometry);
+			}
+		});
+		return geometries.length > 1 ? mergeGeometries(geometries, false) : geometries[0];
+	} else if (ext === 'stl') {
+		const buffer = await file.arrayBuffer();
+		return new STLLoader().parse(buffer);
+	}
+	throw new Error(`Unsupported file type: .${ext}`);
+}
+
+function removeGhostMeshes() {
+	if (!ghostGroup) return;
+	scene.remove(ghostGroup);
+	for (const child of ghostGroup.children) {
+		child.geometry.dispose();
+		child.material.dispose();
+	}
+	ghostGroup = null;
+}
+
+function buildGhostMeshes(hullPoints, worldX, worldY) {
+	removeGhostMeshes();
+	const shape = new THREE.Shape(hullPoints.map(([x, y]) => new THREE.Vector2(x, y)));
+	const fillGeom = new THREE.ShapeGeometry(shape);
+	const fillMat = new THREE.MeshBasicMaterial({ color: 0xffa500, transparent: true, opacity: 0.4, side: THREE.DoubleSide, depthWrite: false });
+	const fillMesh = new THREE.Mesh(fillGeom, fillMat);
+	fillMesh.position.z = 5; // above the footprint mesh (z=0) and the ring line (z=1)
+
+	const loop = [...hullPoints, hullPoints[0]];
+	const flat = [];
+	for (const [x, y] of loop) flat.push(x, y, 5);
+	const lineGeom = new LineGeometry();
+	lineGeom.setPositions(flat);
+	const lineMat = new LineMaterial({ color: 0xffa500, linewidth: 3, resolution: lineResolution() });
+	const line = new Line2(lineGeom, lineMat);
+	line.computeLineDistances();
+
+	ghostGroup = new THREE.Group();
+	ghostGroup.add(fillMesh);
+	ghostGroup.add(line);
+	ghostGroup.position.set(worldX, worldY, 0);
+	scene.add(ghostGroup);
+}
+
+async function startMeshPlacement(request) {
+	teardownMeshPlacement(false);
+
+	let geometry;
+	try {
+		geometry = await parseMeshFile(request.file);
+	} catch (err) {
+		emit('mesh-placement-cancelled', { error: err.message });
+		return;
+	}
+	if (!geometry || !geometry.attributes.position || geometry.attributes.position.count === 0) {
+		emit('mesh-placement-cancelled', { error: 'No usable geometry found in file' });
+		return;
+	}
+
+	const pos = geometry.attributes.position;
+	const xy = [];
+	for (let i = 0; i < pos.count; i++) xy.push([pos.getX(i), pos.getY(i)]);
+	const hull = convexHull2D(xy);
+	if (hull.length < 3) {
+		emit('mesh-placement-cancelled', { error: 'Could not compute a 2D outline from this file' });
+		return;
+	}
+
+	geometry.computeBoundingBox();
+	ghostRawMinZ = geometry.boundingBox.min.z;
+
+	let cx = 0, cy = 0;
+	for (const [x, y] of hull) { cx += x; cy += y; }
+	cx /= hull.length;
+	cy /= hull.length;
+	ghostRawCentroidXY = { x: cx, y: cy };
+	const localHull = hull.map(([x, y]) => [x - cx, y - cy]);
+
+	ghostRotationDeg = 0;
+	ghostSourceRequest = request;
+	buildGhostMeshes(localHull, controls.target.x, controls.target.y);
+
+	// Placement owns mouse/wheel/click entirely while active -- same
+	// reasoning as the original 3D ghost flow: no camera pan/zoom fighting
+	// with ghost-follow/scroll-to-rotate/click-to-confirm. Restored on
+	// teardown.
+	controlsWereEnabled = controls.enabled;
+	controls.enabled = false;
+
+	const dom = renderer.domElement;
+	placementMoveHandler = onGhostPointerMove;
+	placementWheelHandler = onGhostWheel;
+	placementClickHandler = onGhostClick;
+	placementKeyHandler = onGhostKeydown;
+	dom.addEventListener('pointermove', placementMoveHandler);
+	dom.addEventListener('wheel', placementWheelHandler, { passive: false });
+	dom.addEventListener('click', placementClickHandler);
+	window.addEventListener('keydown', placementKeyHandler);
+
+	render();
+}
+
+function onGhostPointerMove(evt) {
+	if (!ghostGroup) return;
+	const hit = screenToWorld(evt);
+	if (hit) {
+		ghostGroup.position.x = hit.x;
+		ghostGroup.position.y = hit.y;
+		render();
+	}
+}
+
+function onGhostWheel(evt) {
+	if (!ghostGroup) return;
+	evt.preventDefault();
+	ghostRotationDeg += evt.deltaY > 0 ? 5 : -5;
+	ghostGroup.rotation.z = THREE.MathUtils.degToRad(ghostRotationDeg);
+	render();
+}
+
+function onGhostClick() {
+	if (!ghostGroup || !ghostSourceRequest) return;
+	const result = {
+		file: ghostSourceRequest.file,
+		note: ghostSourceRequest.note,
+		dx: ghostGroup.position.x - ghostRawCentroidXY.x,
+		dy: ghostGroup.position.y - ghostRawCentroidXY.y,
+		dz: -ghostRawMinZ, // places the mesh's own base at world Z=0 -- no elevation lookup, matching Path 1's flat base_z=0.0 default
+		rotationDeg: ghostRotationDeg,
+	};
+	teardownMeshPlacement(true);
+	emit('mesh-placement-confirmed', result);
+}
+
+function onGhostKeydown(evt) {
+	if (evt.key !== 'Escape') return;
+	teardownMeshPlacement(false);
+	emit('mesh-placement-cancelled', {});
+}
+
+function teardownMeshPlacement() {
+	const dom = renderer && renderer.domElement;
+	if (dom && placementMoveHandler) dom.removeEventListener('pointermove', placementMoveHandler);
+	if (dom && placementWheelHandler) dom.removeEventListener('wheel', placementWheelHandler);
+	if (dom && placementClickHandler) dom.removeEventListener('click', placementClickHandler);
+	if (placementKeyHandler) window.removeEventListener('keydown', placementKeyHandler);
+	placementMoveHandler = null;
+	placementWheelHandler = null;
+	placementClickHandler = null;
+	placementKeyHandler = null;
+
+	removeGhostMeshes();
+	ghostSourceRequest = null;
+	ghostRawCentroidXY = null;
+	ghostRawMinZ = null;
+	ghostRotationDeg = 0;
+
+	if (controls) controls.enabled = controlsWereEnabled;
+	render();
+}
+
+watch(() => props.placeMeshRequest, (newVal) => {
+	if (newVal) startMeshPlacement(newVal);
+	else teardownMeshPlacement(false);
+});
 
 watch(() => props.footprints, rebuildGeometry);
 watch(() => [props.keptIds, props.crossingIds, props.removedIds], () => { applySelectionColors(); render(); }, { deep: true });
@@ -358,6 +601,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
 	window.removeEventListener('resize', onResize);
+	teardownMeshPlacement(false);
 	controls?.dispose();
 	renderer?.dispose();
 });

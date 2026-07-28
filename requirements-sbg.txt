@@ -16,3 +16,5 @@ fastapi
 uvicorn
 orjson
 fast-simplification
+python-multipart
+rtree 

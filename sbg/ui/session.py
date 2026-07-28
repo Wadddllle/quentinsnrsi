@@ -23,16 +23,23 @@ inside this process) -- so the captured reference stays exactly what it was
 at capture time.
 """
 import time
+import uuid
 
 
 class MutationLogEntry:
-    __slots__ = ("op", "building_id", "timestamp", "snapshot")
+    __slots__ = ("op", "building_id", "timestamp", "snapshot", "action_id")
 
-    def __init__(self, op, building_id, snapshot=None):
-        self.op = op  # "remove" | "add"
+    def __init__(self, op, building_id, snapshot=None, action_id=None):
+        self.op = op  # "remove" | "add" | "edit_attributes"
         self.building_id = building_id
         self.timestamp = time.time()
         self.snapshot = snapshot  # the removed CityObject dict (for undo), or None for "add"
+        # None for every ordinary single-op action (the overwhelming
+        # majority) -- a strict backward-compatible addition. Set only when
+        # record_group() pushes several entries that must undo as ONE unit
+        # (e.g. a multi-object CityJSON import, or -- later -- a OneMap
+        # replace's N-removes-plus-M-adds).
+        self.action_id = action_id
 
     def to_dict(self):
         return {"op": self.op, "building_id": self.building_id, "timestamp": self.timestamp}
@@ -45,11 +52,33 @@ class Session:
     def record(self, op, building_id, snapshot=None):
         self.mutation_log.append(MutationLogEntry(op, building_id, snapshot))
 
+    def record_group(self, entries):
+        """entries: list of (op, building_id, snapshot) tuples that must all
+        undo together as one user-facing action (see MutationLogEntry's
+        action_id). Pushed in one call so nothing else can interleave
+        between them, given this project's single-instance/no-concurrency
+        assumption.
+        """
+        action_id = uuid.uuid4().hex
+        for op, building_id, snapshot in entries:
+            self.mutation_log.append(MutationLogEntry(op, building_id, snapshot, action_id=action_id))
+
     def pop_last(self):
-        """Removes and returns the most recent entry, or None if the log is empty."""
+        """Removes and returns the most recent action as a LIST of entries
+        (oldest first within the action) -- one entry for an ordinary single
+        op, several for a record_group()-pushed action (identified by
+        sharing the last entry's action_id). Returns [] if the log is empty,
+        never None -- callers should check for an empty list, not identity.
+        """
         if not self.mutation_log:
-            return None
-        return self.mutation_log.pop()
+            return []
+        last = self.mutation_log.pop()
+        popped = [last]
+        if last.action_id is not None:
+            while self.mutation_log and self.mutation_log[-1].action_id == last.action_id:
+                popped.append(self.mutation_log.pop())
+        popped.reverse()
+        return popped
 
     def summary(self):
         """Groups the log by op for a one-line commit subject, e.g.
@@ -60,7 +89,7 @@ class Session:
             counts[entry.op] = counts.get(entry.op, 0) + 1
         if not counts:
             return "No changes"
-        labels = {"remove": "removed", "add": "added"}
+        labels = {"remove": "removed", "add": "added", "edit_attributes": "edited", "edit_height": "height-edited"}
         parts = [f"{n} building{'s' if n != 1 else ''} {labels.get(op, op)}" for op, n in counts.items()]
         return ", ".join(parts)
 

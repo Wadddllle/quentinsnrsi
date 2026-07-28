@@ -18,6 +18,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+from rasterio.transform import from_origin
 from shapely.geometry import Polygon
 
 from sbg.config import BLENDER_PATH
@@ -85,33 +87,53 @@ def run_stl_pipeline(job, sbg_cm, ring, jobs_root, spatial_index=None):
     job.set_stage("dtm")
     xs, ys, zs = load_points(bbox=(xmin, ymin, xmax, ymax), stride=DTM_STRIDE)
     job.log_line(f"{len(xs)} contour points in domain bbox")
+    dtm_path = job_dir / "dtm.tif"
     if len(xs) == 0:
         # A real, expected case, not just a hypothetical: even domains well
         # within known-good coverage areas can have zero 20m-contour
         # crossings if the enclosed terrain is genuinely flat (confirmed
         # directly -- a 400m box inside the already-proven CBD test area
         # came back with 0 points, an 800m box in a nearby spot had 1404).
-        # Fail with a clear, actionable message instead of a bare numpy
-        # ValueError from build_dtm().
-        raise RuntimeError(
-            "No contour data found inside this domain -- it's likely too small "
-            "and/or over flat terrain with no nearby 20m contour crossings. "
-            "Try drawing a larger domain."
-        )
-    grid_z, transform = build_dtm(xs, ys, zs, step=DTM_STEP)
-    dtm_path = job_dir / "dtm.tif"
-    write_geotiff(grid_z, transform, path=dtm_path)
+        # Direct user instruction: don't fail the whole job over this --
+        # flat terrain with no contour crossings nearby is itself a
+        # perfectly reasonable real answer (that's what "no crossings"
+        # actually means for a 20m-interval contour source), so fall back
+        # to a flat DTM at a sensible default elevation instead of
+        # raising. A tiny margin-padded grid, not a single-cell one, keeps
+        # ElevationLookup's bilinear sampling well-defined at the domain's
+        # own edges.
+        job.log_line("no contour data in this domain -- falling back to flat terrain (0.0m)")
+        margin = DTM_STEP * 2
+        grid_z = np.zeros((4, 4), dtype="float32")
+        transform = from_origin(xmin - margin, ymax + margin, (xmax - xmin + 2 * margin) / 3, (ymax - ymin + 2 * margin) / 3)
+        write_geotiff(grid_z, transform, path=dtm_path)
+    else:
+        grid_z, transform = build_dtm(xs, ys, zs, step=DTM_STEP)
+        write_geotiff(grid_z, transform, path=dtm_path)
     job.log_line(f"wrote {dtm_path}")
 
     job.set_stage("conforming_overlay")
     elevation_lookup = ElevationLookup(dtm_path)
-    conforming_cm, pool = conforming_overlay(
+    conforming_cm, pool, preserved_ids = conforming_overlay(
         sbg_cm, elevation_lookup, domain_polygon,
         spatial_index=spatial_index, log_fn=job.log_line,
     )
     conforming_path = job_dir / "conforming.city.json"
     finalize_and_save(conforming_cm, pool, conforming_path)
     job.log_line(f"wrote {conforming_path} ({len(conforming_cm['CityObjects'])} CityObjects)")
+
+    # Real bug, found via user report: buildings with preserved real mesh
+    # geometry (see conforming_overlay's own comment -- e.g. an OneMap
+    # review-gate replacement) don't have a simple flat roof the way an
+    # LoD1 box extrusion does, so export_stl.py's plunge_base() -- which
+    # assumes "everything except the single highest point is a wall" --
+    # tears them apart instead of safely plunging them into the terrain.
+    # Passed through as a plain id list so export_stl.py (running in
+    # Blender's own separate Python interpreter, no sbg/ imports available)
+    # can tell which imported objects need different treatment.
+    mesh_ids_path = job_dir / "mesh_building_ids.json"
+    with open(mesh_ids_path, "w") as f:
+        json.dump(preserved_ids, f)
 
     job.set_stage("obj_export")
     # cjio 0.10.1's OBJ exporter silently drops all geometry for
@@ -145,6 +167,7 @@ def run_stl_pipeline(job, sbg_cm, ring, jobs_root, spatial_index=None):
     _run_subprocess(job, [
         str(BLENDER_PATH), "--background", "--python", str(EXPORT_STL_SCRIPT), "--",
         "--input", str(obj_path), "--output", str(raw_stl_path),
+        "--mesh-ids-file", str(mesh_ids_path),
     ])
 
     job.set_stage("decimate_and_repair")

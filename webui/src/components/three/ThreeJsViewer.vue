@@ -8,7 +8,7 @@
 <script>
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
-import { AttributeEvaluator, CityJSONLoader, CityJSONWorkerParser, CityObjectsMaterial, TextureManager } from 'cityjson-threejs-loader';
+import { AttributeEvaluator, CityJSONLoader, CityJSONParser, CityJSONWorkerParser, CityObjectsMaterial, TextureManager } from 'cityjson-threejs-loader';
 import { SRGBColorSpace } from 'three';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { GTAOPass, OutputPass, RenderPass } from 'three/examples/jsm/Addons.js';
@@ -214,6 +214,89 @@ export default {
 			type: Array,
 			default: () => []
 		},
+		// Phase 4b (add-building): a small self-contained mini-CityJSON
+		// ({CityObjects, vertices, transform}, same shape subset_cityjson()
+		// produces) covering just the buildings added THIS session -- lets a
+		// just-added building show up immediately with its REAL geometry,
+		// without waiting for the whole-island reload the main citymodel
+		// would otherwise need (see project plan: cityjson-threejs-loader
+		// builds one merged mesh per ~2000-object chunk, not one per
+		// building, so there's no cheap way to patch the real mesh
+		// in-place). Rendered through a second, small, synchronous
+		// CityJSONLoader instance (see updateAddedBuildings below) instead
+		// of approximating it as a box extrusion -- an earlier version did
+		// that, which was exactly right for Path 1 (hypothetical footprint+
+		// height IS a box) but visibly wrong for Path 2/3 (a real imported
+		// building or uploaded mesh has actual shape a box can't represent),
+		// per direct user report.
+		addedCitymodel: {
+			type: Object,
+			default: null
+		},
+		// Phase 4c (OneMap review-gate): the footprint ring(s) of the
+		// existing SBG building(s) currently under review for replacement --
+		// near-exact copy of removedFootprintRings above (same reasoning:
+		// don't touch the real chunk mesh's color/visibility, just flag it
+		// with a distinct outline), different color so "being reviewed"
+		// reads as visually distinct from "already removed."
+		reviewOldFootprintRings: {
+			type: Array,
+			default: () => []
+		},
+		// Phase 4c: the CURRENT (post-nudge) proposed OneMap mesh(es) for
+		// whatever's under review -- same mini-CityJSON shape and same
+		// scoped-CityJSONLoader rendering mechanism as addedCitymodel above,
+		// kept as a SEPARATE prop/group rather than reusing addedCitymodel
+		// directly so a proposal-in-progress (not yet approved, may still be
+		// rejected) can never be confused with a real, already-committed
+		// addition. This is deliberately real, full-fidelity rendering (not
+		// a translucent "ghost") -- per the plan, the point of the
+		// contextual preview is seeing exactly what the new building would
+		// really look like next to its real neighbors, not a placeholder;
+		// the outlined old footprint alongside it is what supplies the
+		// "old vs new" visual contrast.
+		reviewCitymodel: {
+			type: Object,
+			default: null
+		},
+		// Real user report after the outline-only treatment shipped: a
+		// removed/under-review building's real, still-fully-opaque geometry
+		// visually occludes what's behind/underneath it (the removed
+		// building's own outline, or -- worse -- the OneMap review overlay's
+		// proposed mesh, "if it stays there it's overlapping you cant see
+		// shit"). Building ids (not rings) -- resolved to each mesh's own
+		// per-vertex objectid index in updateDimState() below (same
+		// per-mesh-citymodel lookup the click-highlight fix needed) and
+		// applied via a real shader mechanism (CityObjectsMaterial's
+		// setDimState(), a project-local patch -- see webui/patches/ and the
+		// project plan's own risk writeup for why this needed real,
+		// isolated-verified shader work rather than a CSS/material trick).
+		// removedIds fully hides (Remove, can accumulate all session);
+		// reviewOldBuildingIds renders translucent instead (OneMap review,
+		// usually one but can be several once pooled).
+		removedIds: {
+			type: Array,
+			default: () => []
+		},
+		reviewOldBuildingIds: {
+			type: Array,
+			default: () => []
+		},
+		showIslandTerrain: {
+			type: Boolean,
+			default: true
+		},
+		// Height-edit (direct user request: fix "absurdly wrong" LoD1
+		// heights, e.g. a OneMap-backfill height assigned to the wrong
+		// tower). Deliberately a SEPARATE array from removedIds, not
+		// reused -- removedIds also drives the 2D view's gray "removed"
+		// recolor (see OrthoWebGLView.vue), which would be actively wrong
+		// here (the building isn't removed, just height-corrected). This
+		// only ever affects the 3D hide-shader below.
+		editedIds: {
+			type: Array,
+			default: () => []
+		},
 	},
 	data() {
 
@@ -291,11 +374,21 @@ export default {
 			this.updateBoundaryRing();
 			this.updateHighlightFootprints();
 			this.updateRemovedFootprints();
+			this.updateAddedBuildings();
+			this.updateReviewOldFootprints();
+			this.updateReviewOverlay();
 			// Re-shift too: same true-world -> local-frame conversion as the
 			// boundary/highlight overlays, and this citymodel change is the
 			// only thing that re-triggers it if the terrain finished loading
 			// before citymodel.transform was available.
 			this.updateIslandTerrain();
+			// Re-apply too -- a fresh citymodel load means fresh materials
+			// (on the main scene at initial load, or via
+			// updateAddedBuildings/updateReviewOverlay above rebuilding
+			// their own overlay materials from scratch every time), and a
+			// brand new CityObjectsMaterial always starts with DIM_OBJECTS
+			// off until setDimState() is called on it explicitly.
+			this.updateDimState();
 
 			this.updateScene();
 
@@ -326,6 +419,65 @@ export default {
 
 			},
 			deep: true
+		},
+		// Not deep -- SbgViewer3D always reassigns this wholesale on a fresh
+		// fetch (never mutates it in place), same reasoning as citymodel's
+		// own non-deep watch above.
+		addedCitymodel: function () {
+
+			this.updateAddedBuildings();
+			this.updateDimState(); // fresh overlay material -- see citymodel watcher's own comment on why
+			this.updateScene();
+
+		},
+		reviewOldFootprintRings: {
+			handler: function () {
+
+				this.updateReviewOldFootprints();
+				this.updateScene();
+
+			},
+			deep: true
+		},
+		reviewCitymodel: function () {
+
+			this.updateReviewOverlay();
+			this.updateDimState(); // fresh overlay material -- see citymodel watcher's own comment on why
+			this.updateScene();
+
+		},
+		removedIds: {
+			handler: function () {
+
+				this.updateDimState();
+				this.updateScene();
+
+			},
+			deep: true
+		},
+		reviewOldBuildingIds: {
+			handler: function () {
+
+				this.updateDimState();
+				this.updateScene();
+
+			},
+			deep: true
+		},
+		showIslandTerrain: function () {
+
+			this.updateIslandTerrain();
+
+		},
+		editedIds: {
+
+			handler: function () {
+
+				this.updateDimState();
+
+			},
+			deep: true
+
 		},
 		selectedObjid: function () {
 
@@ -524,6 +676,33 @@ export default {
 		this.boundaryLine = null;
 		this.highlightLines = [];
 		this.removedLines = [];
+		// Phase 4b (add-building): the THREE.Group a scoped CityJSONLoader
+		// puts its real-geometry mesh(es) into for buildings added this
+		// session -- kept out of data() like everything else here, same
+		// reasoning (real THREE.js objects, not something Vue's reactivity
+		// should wrap).
+		this.addedBuildingsGroup = null;
+		// Phase 4c (OneMap review-gate): reviewLines mirrors highlightLines/
+		// removedLines (an outline per old-footprint-under-review);
+		// reviewBuildingsGroup mirrors addedBuildingsGroup (the scoped
+		// CityJSONLoader's group for the current proposed mesh(es)) -- kept
+		// deliberately separate from the add-building versions of both, see
+		// reviewCitymodel's own prop comment.
+		this.reviewLines = [];
+		this.reviewBuildingsGroup = null;
+		// Real perf regression found via direct user report: updateScene()
+		// (fires on every camera-drag frame AND on every chunk-loaded
+		// callback during a full-island load) used to call
+		// `Object.keys(citymodel.CityObjects).indexOf(id)` fresh every time
+		// it needed to resolve the selected id to an integer index -- for
+		// the real 118,780-building citymodel that's a ~118K-key array
+		// build PLUS a linear scan, repeated per material per call. A
+		// WeakMap cache keyed by the citymodel object itself (never
+		// mutated in place, only ever replaced wholesale -- same invariant
+		// citymodel's own non-deep watcher already relies on) means the
+		// expensive id->index Map is built at most ONCE per citymodel
+		// object, not once per updateScene() call.
+		this._objectIndexCache = new WeakMap();
 		// islandTerrainMesh: the built THREE.Mesh (kept out of data() like
 		// everything else here). terrainRaw: the raw fetched heightfield (a
 		// Float32Array wrapped in a plain object) -- also kept out of
@@ -546,6 +725,10 @@ export default {
 		this.updateBoundaryRing();
 		this.updateHighlightFootprints();
 		this.updateRemovedFootprints();
+		this.updateAddedBuildings();
+		this.updateReviewOldFootprints();
+		this.updateReviewOverlay();
+		this.updateDimState();
 
 		this.loadCitymodel( this.citymodel );
 
@@ -556,13 +739,13 @@ export default {
 		this.renderer.domElement.addEventListener( 'pointerup', this.pointerUp, false );
 
 		const scope = this;
-		// getIslandTerrain().then( data => {
+		getIslandTerrain().then( data => {
 
-		// 	scope.terrainRaw = data;
-		// 	scope.updateIslandTerrain();
-		// 	scope.updateScene();
+			scope.terrainRaw = data;
+			scope.updateIslandTerrain();
+			scope.updateScene();
 
-		// } );
+		} );
 
 	},
 	methods: {
@@ -821,13 +1004,34 @@ export default {
 
 			}
 
-			const idx = Object.keys( this.citymodel.CityObjects || {} ).indexOf( this.selectedObjid );
-
 			this.scene.traverse( c => {
 
 				if ( c.material ) {
 
 					const mats = Array.isArray( c.material ) ? c.material : [ c.material ];
+
+					// Real bug found via user report: idx used to be computed
+					// ONCE from this.citymodel (the main whole-island
+					// citymodel) and applied to every material found by this
+					// traverse -- including the added/review overlay groups'
+					// own, separate CityObjectsMaterial instances, each built
+					// by its own small, independently-indexed CityJSONLoader/
+					// CityJSONParser (see updateAddedBuildings/
+					// updateReviewOverlay). The uniform genuinely reached
+					// those materials (they're real children of this.scene),
+					// it just meant the wrong thing there -- objectIndex 5 in
+					// the main citymodel is a different building (or
+					// nothing) than objectIndex 5 in a 3-building overlay.
+					// Resolve idx per-mesh from THAT mesh's own citymodel
+					// (already stored on every CityObjectsMesh at
+					// construction -- the same property
+					// resolveIntersectionInfo() already relies on for the
+					// click-to-select direction) instead of one hoisted
+					// outer value shared by every material -- via the
+					// cached lookup (see _objectIndexCache's own comment),
+					// not a fresh Object.keys()/indexOf() scan every call.
+					const meshCitymodel = c.citymodel || this.citymodel;
+					const idx = this.resolveObjectIndex( meshCitymodel, this.selectedObjid );
 
 					for ( const mat of mats ) {
 
@@ -1099,6 +1303,8 @@ export default {
 			if ( "debug" in this.getParams() ) {
 
 				window.__threeJsViewerCamera = this.camera; // for console/automated inspection only
+				window.__threeJsViewerScene = this.scene; // for console/automated inspection only
+				window.__threeJsViewerUpdateScene = this.updateScene.bind( this ); // for console/automated inspection only
 
 				const gui = new GUI();
 
@@ -1196,7 +1402,7 @@ export default {
 			// coordinate unrelated to any real content), which never fired
 			// before Phase 1 started reloading citymodel after mount. See the
 			// project plan's lighting-bug writeup for how this was found.
-			const keep = new Set( [ this.ambientLight, this.spotLight, this.spotLight.target, this.boundaryLine, this.islandTerrainMesh, ...this.highlightLines, ...this.removedLines ] );
+			const keep = new Set( [ this.ambientLight, this.spotLight, this.spotLight.target, this.boundaryLine, this.islandTerrainMesh, this.addedBuildingsGroup, this.reviewBuildingsGroup, ...this.highlightLines, ...this.removedLines, ...this.reviewLines ] );
 			for ( const child of [ ...this.scene.children ] ) {
 
 				if ( ! keep.has( child ) ) this.scene.remove( child );
@@ -1335,6 +1541,191 @@ export default {
 			}
 
 		},
+		// Phase 4b (add-building): renders REAL geometry for buildings added
+		// this session, via a second, small, synchronous CityJSONLoader
+		// instance (CityJSONParser, not CityJSONWorkerParser -- no worker
+		// postMessage/structuredClone overhead worth paying for a handful of
+		// objects, and it means this can run synchronously instead of
+		// juggling another async completion callback). addedCitymodel
+		// carries the SAME transform (scale+translate) as the main
+		// citymodel (see sbg.io_cityjson.subset_cityjson, which copies
+		// cm["transform"] verbatim) -- CityJSONLoader.load() always zeroes
+		// out translation from its matrix (see this file's own notes on
+		// that elsewhere), so the resulting mesh lands in exactly the same
+		// local frame as everything else in this scene, no extra shift
+		// needed. An earlier version approximated every add as a flat-
+		// topped box extruded from its footprint+height -- exactly right
+		// for Path 1 (that box IS the real geometry) but visibly wrong for
+		// Path 2/3 (a real imported CityJSON building or uploaded mesh has
+		// actual wall/roof shape a box can't represent), per direct user
+		// report.
+		updateAddedBuildings() {
+
+			if ( this.addedBuildingsGroup ) {
+
+				this.scene.remove( this.addedBuildingsGroup );
+				this.addedBuildingsGroup.traverse( ( child ) => {
+
+					if ( child.geometry ) child.geometry.dispose();
+					if ( child.material ) child.material.dispose();
+
+				} );
+				this.addedBuildingsGroup = null;
+
+			}
+
+			if ( ! this.addedCitymodel || Object.keys( this.addedCitymodel.CityObjects || {} ).length === 0 ) return;
+
+			const loader = new CityJSONLoader( new CityJSONParser() );
+			loader.load( this.addedCitymodel );
+			this.addedBuildingsGroup = loader.scene;
+			this.scene.add( this.addedBuildingsGroup );
+
+		},
+		// Phase 4c (OneMap review-gate): near-exact copy of
+		// updateRemovedFootprints -- outlines the existing SBG building(s)
+		// currently proposed for replacement, distinct orange color so it
+		// doesn't read as either "removed" (dark gray) or "crossing warning"
+		// (red).
+		updateReviewOldFootprints() {
+
+			for ( const line of this.reviewLines ) {
+
+				this.scene.remove( line );
+				line.geometry.dispose();
+				line.material.dispose();
+
+			}
+			this.reviewLines = [];
+
+			if ( ! this.reviewOldFootprintRings || this.reviewOldFootprintRings.length === 0 ) return;
+
+			const z = 2;
+			const [ tx, ty ] = this.citymodel?.transform?.translate || [ 0, 0 ];
+
+			for ( const ring of this.reviewOldFootprintRings ) {
+
+				if ( ! ring || ring.length < 2 ) continue;
+
+				const points = ring.map( ( [ x, y ] ) => new THREE.Vector3( x - tx, y - ty, z ) );
+				points.push( points[ 0 ] );
+
+				const line = this.makeFatLine( points, 0xffa500, 3 );
+				this.reviewLines.push( line );
+				this.scene.add( line );
+
+			}
+
+		},
+		// Phase 4c: near-exact copy of updateAddedBuildings -- renders the
+		// CURRENT (post-nudge) proposed mesh(es) via the same scoped,
+		// synchronous CityJSONLoader mechanism, kept in a separate group so
+		// a still-under-review proposal is never confused with a real,
+		// already-committed addition (see reviewCitymodel's own prop
+		// comment for why this isn't just reused directly).
+		updateReviewOverlay() {
+
+			if ( this.reviewBuildingsGroup ) {
+
+				this.scene.remove( this.reviewBuildingsGroup );
+				this.reviewBuildingsGroup.traverse( ( child ) => {
+
+					if ( child.geometry ) child.geometry.dispose();
+					if ( child.material ) child.material.dispose();
+
+				} );
+				this.reviewBuildingsGroup = null;
+
+			}
+
+			if ( ! this.reviewCitymodel || Object.keys( this.reviewCitymodel.CityObjects || {} ).length === 0 ) return;
+
+			const loader = new CityJSONLoader( new CityJSONParser() );
+			loader.load( this.reviewCitymodel );
+			this.reviewBuildingsGroup = loader.scene;
+			this.scene.add( this.reviewBuildingsGroup );
+
+		},
+		// Cached id->index resolution -- see _objectIndexCache's own
+		// beforeCreate() comment for why this exists (a real perf
+		// regression: Object.keys(citymodel.CityObjects).indexOf(id) is
+		// O(n) to BUILD the array alone, at 118,780 keys for the real
+		// dataset, and was being redone on every updateScene() call).
+		// citymodel is never mutated in place (only ever replaced
+		// wholesale), so the built Map stays valid for the citymodel
+		// object's whole lifetime -- no manual invalidation needed, the
+		// WeakMap entry just becomes unreachable when the citymodel
+		// reference itself is replaced.
+		resolveObjectIndex( citymodel, id ) {
+
+			if ( ! citymodel || id == null ) return - 1;
+
+			let map = this._objectIndexCache.get( citymodel );
+			if ( ! map ) {
+
+				map = new Map();
+				const keys = Object.keys( citymodel.CityObjects || {} );
+				for ( let i = 0; i < keys.length; i ++ ) map.set( keys[ i ], i );
+				this._objectIndexCache.set( citymodel, map );
+
+			}
+
+			return map.has( id ) ? map.get( id ) : - 1;
+
+		},
+		// Real per-object shader mechanism (see webui/patches/ and the
+		// project plan's own risk writeup) -- a real user report that a
+		// removed/under-review building's still-fully-opaque real geometry
+		// visually blocks what's behind it (the OneMap review overlay's
+		// proposed mesh, most concretely). removedIds/reviewOldBuildingIds
+		// are STRING CityObject ids; each mesh's shader only understands its
+		// OWN per-vertex integer `objectid`, indexed into THAT mesh's own
+		// citymodel -- same per-mesh resolution the click-highlight fix in
+		// updateScene() needs, and for the identical reason (the main scene
+		// and the added/review overlay groups are built by separate loader
+		// instances, each with its own citymodel and its own indexing).
+		// Deliberately NOT called from updateScene() itself, which runs on
+		// every camera-drag frame -- recomputing Object.keys().indexOf()
+		// for every mesh on every frame would be real, avoidable overhead;
+		// this only needs to re-run when removedIds/reviewOldBuildingIds
+		// actually change, or when a fresh overlay material is built (see
+		// this file's other updateDimState() call sites).
+		updateDimState() {
+
+			this.scene.traverse( c => {
+
+				// Guard on setDimState itself, not just isCityObjectsMaterial --
+				// a real production incident (user report, uncaught
+				// "c.material.setDimState is not a function" firing on every
+				// click/selection change) showed a mesh can carry
+				// isCityObjectsMaterial=true from a material instance that
+				// doesn't have the patched method, almost certainly a stale
+				// module instance in a long-lived dev-server tab (Vite HMR
+				// swapping ThreeJsViewer.vue's own code doesn't retroactively
+				// upgrade already-constructed third-party material objects
+				// built from an older module graph). Letting this throw
+				// inside a watcher callback aborted the reactivity flush that
+				// runs on every selectedObjid change -- i.e. every click --
+				// which is what actually broke building-select and, from
+				// there, cascaded into other UI appearing unresponsive. A
+				// missing method here should just skip dim/hide for that one
+				// mesh, never take down the rest of the app.
+				if ( c.material && c.material.isCityObjectsMaterial && c.citymodel && typeof c.material.setDimState === 'function' ) {
+
+					const hidden = [ ...this.removedIds, ...this.editedIds ]
+						.map( id => this.resolveObjectIndex( c.citymodel, id ) )
+						.filter( i => i >= 0 );
+					const dimmed = this.reviewOldBuildingIds
+						.map( id => this.resolveObjectIndex( c.citymodel, id ) )
+						.filter( i => i >= 0 );
+
+					c.material.setDimState( { hiddenObjIds: hidden, reviewDimObjIds: dimmed, reviewDimOpacity: 0.25 } );
+
+				}
+
+			} );
+
+		},
 		getLods() {
 
 			return this.lods;
@@ -1367,7 +1758,7 @@ export default {
 
 			}
 
-			if ( ! this.terrainRaw ) return;
+			if ( ! this.terrainRaw || ! this.showIslandTerrain ) return;
 
 			const { ncols, nrows, xmin, ymax, step, heights } = this.terrainRaw;
 			// Same true-world -> local-frame conversion as updateBoundaryRing --
@@ -1436,8 +1827,29 @@ export default {
 			// This overlay exists for visual orientation only (see
 			// island_terrain.py's module docstring), not to be mistaken for
 			// real terrain data at building-adjacent precision.
-			const material = new THREE.MeshStandardMaterial( { color: 0x9caf7c, side: THREE.DoubleSide } );
+			//
+			// Real bug, user report: "40% of buildings turned green" --
+			// measured directly (not assumed): this coarse whole-island DTM
+			// (20m-interval, 1:250,000-scale source contours) has its
+			// interpolated elevation exceed the building's own roof height
+			// at that spot for 66.5% of a random sample, median overshoot
+			// 8m, 90th percentile 16m, up to 52m. Not fixable by nudging
+			// the terrain height down a fixed amount -- the overshoot
+			// distribution is too wide, any single offset either barely
+			// helps or pushes genuinely-elevated real terrain unrealistically
+			// low everywhere else. This data was never going to be precise
+			// enough to trust for building-level depth comparisons (that's
+			// the whole reason it's explicitly "visual orientation only").
+			// depthWrite: false (terrain never occludes anything drawn
+			// after it, regardless of whose Z is technically closer) +
+			// renderOrder ensuring it draws first (so it still shows
+			// correctly wherever nothing else is drawn over it) means
+			// buildings always render through the terrain overlay
+			// unconditionally, without needing the terrain's own elevation
+			// to be trustworthy at building precision.
+			const material = new THREE.MeshStandardMaterial( { color: 0x9caf7c, side: THREE.DoubleSide, depthWrite: false } );
 			this.islandTerrainMesh = new THREE.Mesh( geometry, material );
+			this.islandTerrainMesh.renderOrder = -1;
 			this.scene.add( this.islandTerrainMesh );
 
 		}

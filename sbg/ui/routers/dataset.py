@@ -5,9 +5,9 @@ Phase 6, Phase 1 build order item.
 """
 import orjson
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import ORJSONResponse
 
 from sbg.io_cityjson import subset_cityjson
+from sbg.ui.responses import orjson_response
 
 router = APIRouter(prefix="/api/dataset", tags=["dataset"])
 
@@ -29,10 +29,9 @@ def get_buildings(bbox: str, request: Request):
     footprint merely intersects the bbox are included whole (not clipped),
     so panning slightly won't cut buildings in half mid-view.
 
-    Returned via ORJSONResponse, constructed explicitly (see /footprints
-    below for why: FastAPI's default jsonable_encoder pass is the dominant
-    cost for a large plain-dict/list payload like this, not the actual JSON
-    serialization).
+    Returned via orjson_response() (see /footprints below for why:
+    FastAPI's default jsonable_encoder pass is the dominant cost for a large
+    plain-dict/list payload like this, not the actual JSON serialization).
     """
     xmin, ymin, xmax, ymax = _parse_bbox(bbox)
     index = request.app.state.spatial_index
@@ -56,7 +55,7 @@ def get_buildings(bbox: str, request: Request):
         return Response(content=body, media_type="application/json")
     if not ids:
         cm = request.app.state.cm
-        return ORJSONResponse({
+        return orjson_response({
             "type": "CityJSON",
             "version": cm["version"],
             "transform": cm["transform"],
@@ -64,7 +63,7 @@ def get_buildings(bbox: str, request: Request):
             "CityObjects": {},
             "vertices": [],
         })
-    return ORJSONResponse(subset_cityjson(request.app.state.cm, ids))
+    return orjson_response(subset_cityjson(request.app.state.cm, ids))
 
 
 @router.get("/footprints")
@@ -82,14 +81,15 @@ def get_footprints(bbox: str, request: Request):
     (a slow recursive type-checking walk of the return value before handing
     it to the JSON encoder), which is pure overhead here since every value
     in these records is already a plain JSON-serializable primitive.
-    Constructing `ORJSONResponse` directly and returning it bypasses that
-    pass entirely (FastAPI does not re-process a Response object a handler
-    returns) and uses `orjson`'s Rust-based encoder besides.
+    Constructing a plain Response with orjson-encoded bytes directly (see
+    orjson_response() above) bypasses that pass entirely (FastAPI does not
+    re-process a Response object a handler returns) and uses `orjson`'s
+    Rust-based encoder besides.
     """
     xmin, ymin, xmax, ymax = _parse_bbox(bbox)
     index = request.app.state.spatial_index
     ids = index.query_intersects_bbox(xmin, ymin, xmax, ymax)
-    return ORJSONResponse({"buildings": [index.footprint_records[obj_id] for obj_id in ids]})
+    return orjson_response({"buildings": [index.footprint_records[obj_id] for obj_id in ids]})
 
 
 @router.get("/terrain")

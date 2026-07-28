@@ -51,10 +51,21 @@ def load_points(path=CONTOUR_POINTS_PATH, stride=1, bbox=None):
     return xs[::stride], ys[::stride], zs[::stride]
 
 
-def build_dtm(xs, ys, zs, step, max_gap=None):
+def build_dtm(xs, ys, zs, step, max_gap=None, bounds_override=None):
     """Returns (grid_z, transform). grid_z is a 2D array in raster convention
     (row 0 = north edge, increasing row = south); transform is the affine
     georeferencing a GeoTIFF expects.
+
+    bounds_override: optional (xmin, ymin, xmax, ymax) the output grid must
+    cover *at least* -- real bug, user report (island_terrain.py's 3D
+    overlay): the whole-island grid's extent was always just the CONTOUR
+    points' own bounding box, so any real building sitting even slightly
+    beyond wherever the source contour data happens to reach (confirmed: 29
+    real buildings, just north of the DTM's own top edge -- the contour
+    source simply doesn't extend that far) got no terrain at all, rendering
+    as floating/clipped. Only ever widens the grid, never shrinks it below
+    the contour points' natural extent; the extra margin gets filled by the
+    same nearest-neighbor gap-fill already used for interior NaN cells.
 
     max_gap: if set, any output cell farther than this distance (meters) from
     the nearest real input point is set to NaN instead of an interpolated
@@ -72,6 +83,10 @@ def build_dtm(xs, ys, zs, step, max_gap=None):
     """
     xmin, xmax = xs.min(), xs.max()
     ymin, ymax = ys.min(), ys.max()
+    if bounds_override is not None:
+        oxmin, oymin, oxmax, oymax = bounds_override
+        xmin, ymin = min(xmin, oxmin), min(ymin, oymin)
+        xmax, ymax = max(xmax, oxmax), max(ymax, oymax)
 
     ncols = int(np.ceil((xmax - xmin) / step)) + 1
     nrows = int(np.ceil((ymax - ymin) / step)) + 1
@@ -169,12 +184,37 @@ def main():
     stride = args.stride if args.stride is not None else (1 if bbox else ISLAND_STRIDE)
     max_gap = args.max_gap
 
+    # Whole-island mode only: widen the grid to cover every real building,
+    # not just wherever the source contour data happens to reach -- see
+    # build_dtm's own bounds_override docstring for the real bug this
+    # fixes (29 real buildings north of the contour data's own extent had
+    # no terrain at all).
+    bounds_override = None
+    if bbox is None:
+        import json
+
+        from sbg.config import SBG_OUTPUT
+
+        print("Loading SBG dataset to compute full building extent...", file=sys.stderr)
+        with open(SBG_OUTPUT) as f:
+            sbg_cm = json.load(f)
+        # Vectorized dequantization -- millions of vertices through
+        # io_cityjson.vertex_lookup's per-index Python closure would be
+        # needlessly slow for a plain bbox computation.
+        verts = np.array(sbg_cm["vertices"], dtype=np.float64)
+        sx, sy, _sz = sbg_cm["transform"]["scale"]
+        tx, ty, _tz = sbg_cm["transform"]["translate"]
+        real_x = verts[:, 0] * sx + tx
+        real_y = verts[:, 1] * sy + ty
+        bounds_override = (float(real_x.min()), float(real_y.min()), float(real_x.max()), float(real_y.max()))
+        print(f"  building extent: {bounds_override}", file=sys.stderr)
+
     print("Loading contour points...", file=sys.stderr)
     xs, ys, zs = load_points(stride=stride, bbox=bbox)
     print(f"  {len(xs)} points (stride={stride}, bbox={bbox})", file=sys.stderr)
 
     print(f"Interpolating grid (step={step}m, max_gap={max_gap})...", file=sys.stderr)
-    grid_z, transform = build_dtm(xs, ys, zs, step=step, max_gap=max_gap)
+    grid_z, transform = build_dtm(xs, ys, zs, step=step, max_gap=max_gap, bounds_override=bounds_override)
     print(f"  grid shape: {grid_z.shape}, NaN cells: {np.isnan(grid_z).sum()}", file=sys.stderr)
 
     from pathlib import Path

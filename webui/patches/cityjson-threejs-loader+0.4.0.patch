@@ -1,3 +1,213 @@
+diff --git a/node_modules/cityjson-threejs-loader/src/materials/CityObjectsBaseMaterial.js b/node_modules/cityjson-threejs-loader/src/materials/CityObjectsBaseMaterial.js
+index 7e93822..cddf6ce 100644
+--- a/node_modules/cityjson-threejs-loader/src/materials/CityObjectsBaseMaterial.js
++++ b/node_modules/cityjson-threejs-loader/src/materials/CityObjectsBaseMaterial.js
+@@ -11,7 +11,24 @@ UniformsLib.cityobject = {
+ 	highlightedObjId: { value: - 1 },
+ 	highlightedGeomId: { value: - 1 },
+ 	highlightedBoundId: { value: - 1 },
+-	highlightColor: { value: new Color( 0xFFC107 ).convertSRGBToLinear() }
++	highlightColor: { value: new Color( 0xFFC107 ).convertSRGBToLinear() },
++	// sbg patch (see webui/patches/): per-object hide/dim, driven by the
++	// same `objectid` attribute the highlight uniforms above already use.
++	// hiddenObjIds[]/hiddenObjIdCount fully hide (alpha=0, then discarded
++	// entirely, see the fragment shader) any number of objects (a whole
++	// session's worth of Removed buildings). reviewDimObjIds[]/
++	// reviewDimObjIdCount/reviewDimOpacity render any number of objects
++	// translucent at one SHARED opacity (the old building(s) currently
++	// pooled into an open OneMap review -- can be more than one, see
++	// sbg/ui/onemap_review.py's pooling support). Two independent array
++	// mechanisms sharing one shader technique and one opacity each, not one
++	// combined mechanism -- Remove and Review are conceptually separate
++	// even though both can be non-empty at the same time.
++	hiddenObjIds: { value: [] },
++	hiddenObjIdCount: { value: 0 },
++	reviewDimObjIds: { value: [] },
++	reviewDimObjIdCount: { value: 0 },
++	reviewDimOpacity: { value: 0.25 }
+ 
+ };
+ 
+@@ -59,6 +76,18 @@ ShaderChunk.cityobjectinclude_vertex = `
+ 
+             varying float discard_;
+ 
++        #endif
++
++        #ifdef DIM_OBJECTS
++
++            uniform float hiddenObjIds[ MAX_HIDDEN_OBJIDS ];
++            uniform int hiddenObjIdCount;
++            uniform float reviewDimObjIds[ MAX_HIDDEN_OBJIDS ];
++            uniform int reviewDimObjIdCount;
++            uniform float reviewDimOpacity;
++
++            varying float dimFactor_;
++
+         #endif
+ 
+ 		#ifdef MATERIAL_THEME
+@@ -151,6 +180,46 @@ ShaderChunk.cityobjectshowlod_vertex = `
+         #endif
+     `;
+ 
++// sbg patch (see webui/patches/): per-object hide/dim -- see
++// UniformsLib.cityobject's own comment above for why this is two small
++// array uniform pairs (one for Remove, one for Review, sharing one
++// "compare objectid, adjust alpha" technique) rather than one generic
++// mechanism. The loop bound (MAX_HIDDEN_OBJIDS) is a compile-time constant
++// with a uniform-driven early break -- a standard, portable GLSL idiom for
++// a variable-length uniform array (the array itself must be fixed-size to
++// satisfy GLSL's own compile-time-size requirement for uniform arrays).
++ShaderChunk.cityobjectdim_vertex = `
++        #ifdef DIM_OBJECTS
++
++            dimFactor_ = 1.0;
++
++            for ( int i = 0; i < MAX_HIDDEN_OBJIDS; i ++ ) {
++
++                if ( i >= hiddenObjIdCount ) break;
++
++                if ( abs( objectid - hiddenObjIds[ i ] ) < 0.5 ) {
++
++                    dimFactor_ = 0.0;
++
++                }
++
++            }
++
++            for ( int i = 0; i < MAX_HIDDEN_OBJIDS; i ++ ) {
++
++                if ( i >= reviewDimObjIdCount ) break;
++
++                if ( abs( objectid - reviewDimObjIds[ i ] ) < 0.5 ) {
++
++                    dimFactor_ = reviewDimOpacity;
++
++                }
++
++            }
++
++        #endif
++    `;
++
+ export class CityObjectsBaseMaterial extends ShaderMaterial {
+ 
+ 	constructor( shader ) {
+@@ -173,6 +242,12 @@ export class CityObjectsBaseMaterial extends ShaderMaterial {
+ 		this.defines.SEMANTIC_COUNT = 0;
+ 		this.defines.ATTRIBUTE_COUNT = 0;
+ 		this.defines.MATERIAL_COUNT = 0;
++		// sbg patch: always present (unlike DIM_OBJECTS itself, which is
++		// conditional) -- a plain compile-time array-size constant, unused
++		// and harmless when DIM_OBJECTS is off. Matches this project's own
++		// "dozens, not thousands" per-session scale assumption used
++		// elsewhere (e.g. SpatialIndex.pending_additions).
++		this.defines.MAX_HIDDEN_OBJIDS = 256;
+ 
+ 	}
+ 
+@@ -475,4 +550,54 @@ export class CityObjectsBaseMaterial extends ShaderMaterial {
+ 
+ 	}
+ 
++	/**
++	 * sbg patch (see webui/patches/): single combined setter for the
++	 * per-object hide/dim state, deliberately not several independent
++	 * property setters -- hiddenObjIds and reviewDimObjIds both need to
++	 * agree on whether DIM_OBJECTS should be compiled in at all (and
++	 * whether `transparent` should be on), so bundling them avoids one
++	 * setter clobbering the other's view of that shared decision (same
++	 * reasoning `highlightedObject` above already follows for its own
++	 * three values).
++	 *
++	 * hiddenObjIds: array of objectid floats to fully hide (Remove -- can
++	 * accumulate across a whole session, capped at MAX_HIDDEN_OBJIDS).
++	 * reviewDimObjIds/reviewDimOpacity: array of objectid floats to render
++	 * translucent at one shared opacity instead of hidden (OneMap review --
++	 * usually one, but can be several once multiple existing buildings are
++	 * pooled into a single replacement).
++	 */
++	setDimState( { hiddenObjIds = [], reviewDimObjIds = [], reviewDimOpacity = 0.25 } = {} ) {
++
++		const isActive = hiddenObjIds.length > 0 || reviewDimObjIds.length > 0;
++		const wasActive = 'DIM_OBJECTS' in this.defines;
++
++		if ( isActive !== wasActive ) {
++
++			this.needsUpdate = true;
++			this.transparent = isActive;
++
++		}
++
++		if ( isActive ) {
++
++			this.defines.DIM_OBJECTS = '';
++
++		} else {
++
++			delete this.defines.DIM_OBJECTS;
++
++		}
++
++		const cap = this.defines.MAX_HIDDEN_OBJIDS;
++		const cappedHidden = hiddenObjIds.slice( 0, cap );
++		this.uniforms.hiddenObjIds.value = cappedHidden;
++		this.uniforms.hiddenObjIdCount.value = cappedHidden.length;
++		const cappedReview = reviewDimObjIds.slice( 0, cap );
++		this.uniforms.reviewDimObjIds.value = cappedReview;
++		this.uniforms.reviewDimObjIdCount.value = cappedReview.length;
++		this.uniforms.reviewDimOpacity.value = reviewDimOpacity;
++
++	}
++
+ }
+diff --git a/node_modules/cityjson-threejs-loader/src/materials/CityObjectsMaterial.js b/node_modules/cityjson-threejs-loader/src/materials/CityObjectsMaterial.js
+index a8ab88c..2a43ae3 100644
+--- a/node_modules/cityjson-threejs-loader/src/materials/CityObjectsMaterial.js
++++ b/node_modules/cityjson-threejs-loader/src/materials/CityObjectsMaterial.js
+@@ -23,11 +23,13 @@ export class CityObjectsMaterial extends CityObjectsBaseMaterial {
+ 			`
+ 			+ ShaderChunk.cityobjectdiffuse_vertex
+ 			+ ShaderChunk.cityobjectshowlod_vertex
++			+ ShaderChunk.cityobjectdim_vertex
+ 		);
+ 		newShader.fragmentShader =
+ 		`
+ 			varying vec3 diffuse_;
+ 			varying float discard_;
++			varying float dimFactor_;
+ 
+ 			#ifdef TEXTURE_THEME
+ 
+@@ -49,6 +51,27 @@ export class CityObjectsMaterial extends CityObjectsBaseMaterial {
+ 			`
+ 			vec4 diffuseColor = vec4( diffuse_, opacity );
+ 
++			#ifdef DIM_OBJECTS
++
++				// A pure alpha multiply left a faint outline on fully-hidden
++				// objects (found via direct isolated testing, not assumed) --
++				// alpha=0 still writes the depth buffer by default, and the
++				// GTAO postprocessing pass samples depth, so a "hidden"
++				// building's edges still showed up as occlusion artifacts.
++				// Hard discard (same mechanism SHOW_LOD already uses below)
++				// avoids any depth-buffer trace for the fully-hidden case;
++				// alpha blending is only actually needed for the partial-dim
++				// (Review) case.
++				if ( dimFactor_ <= 0.0 ) {
++
++					discard;
++
++				}
++
++				diffuseColor.a *= dimFactor_;
++
++			#endif
++
+ 			#ifdef TEXTURE_THEME
+ 
+ 				if ( vTexIndex > - 1 ) {
 diff --git a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js b/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js
 index e0f5ce8..ad9483a 100644
 --- a/node_modules/cityjson-threejs-loader/src/objects/CityObjectsInstancedMesh.js

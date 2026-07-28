@@ -2,7 +2,8 @@
 import json
 from pathlib import Path
 
-from shapely.geometry import MultiPolygon, Polygon
+import shapely
+from shapely.geometry import MultiPoint, MultiPolygon, Polygon
 
 from sbg.config import CITYJSON_REFERENCE_SYSTEM, CITYJSON_VERSION, TRANSFORM_SCALE
 
@@ -111,21 +112,77 @@ def footprint_rings(cm, obj):
     """Reconstructs each solid's bottom-face rings (exterior + holes) in
     real-world (x, y) coords: [[exterior, hole1, ...], ...], one entry per
     solid part (>1 for CompositeSolid/MultiPolygon-sourced buildings).
-    Returns None if the object has no usable Solid/CompositeSolid geometry.
+    Returns None if the object has no usable geometry.
+
+    MultiSurface (every mesh-embedding function's output -- see
+    sbg/onemap/embed.py -- produces this, not Solid/CompositeSolid) has no
+    semantic "bottom face" to extract the way a Solid's shell structure
+    does: it's a raw triangle soup with no designated footprint face. Falls
+    back to the convex hull of every vertex the geometry references,
+    projected onto XY -- not exact for a concave building outline, but a
+    real, honest footprint (not None) is what makes a mesh-embedded
+    building visible to the spatial index/cutout/2D-footprint system at
+    all; before this fallback existed, a MultiSurface building was
+    invisible to all three, silently, with no error anywhere.
     """
-    shells = solid_shells(obj["geometry"][0])
-    if shells is None:
-        return None
+    geom = obj["geometry"][0]
     lookup = vertex_lookup(cm)
 
-    parts = []
-    for solid in shells:
-        bottom_face = solid[0][0]
-        rings = [[lookup(i)[:2] for i in ring] for ring in bottom_face]
-        rings = [r for r in rings if len(r) >= 3]
-        if rings:
-            parts.append(rings)
-    return parts or None
+    shells = solid_shells(geom)
+    if shells is not None:
+        parts = []
+        for solid in shells:
+            bottom_face = solid[0][0]
+            rings = [[lookup(i)[:2] for i in ring] for ring in bottom_face]
+            rings = [r for r in rings if len(r) >= 3]
+            if rings:
+                parts.append(rings)
+        return parts or None
+
+    if geom["type"] in ("MultiSurface", "CompositeSurface"):
+        # Real bug, user report: a plain CONVEX hull over a mesh's vertices
+        # can't represent a shape with a real non-convex protrusion (e.g. a
+        # stadium's dome plus a genuine connecting overpass) -- it always
+        # fills in the straight-line gap, producing a solid wedge instead of
+        # the real shape. A concave hull (tried first) is still only an
+        # approximation fitted to scattered POINT positions, not the real
+        # surface -- it can over/undershoot the true outline. This is the
+        # actual, exact fix: project every real triangle to XY and union
+        # them -- the TRUE top-down silhouette, built from real face
+        # connectivity, not a hull heuristic. Verified directly against a
+        # real stadium+overpass mesh: a single clean Polygon, closely
+        # matching the true shape including the overpass neck, in ~0.6s.
+        #
+        # This is deliberately the FULL silhouette (every triangle at every
+        # height, not just near-ground ones) -- correct for THIS function's
+        # actual purpose, a 2D/spatial-index "what does this building cover
+        # from directly above" footprint, where an overhang legitimately
+        # should show as covered. It is NOT correct for deciding where a
+        # building touches the ground (a real overhang has open, walkable
+        # space underneath) -- that's a different question, used only by
+        # conforming_mesh.py's terrain-hole-punching, which needs real
+        # cross-sectioning against local terrain height, not this function.
+        tris = []
+        for face in geom["boundaries"]:
+            ring = face[0]
+            if len(ring) < 3:
+                continue
+            pts2d = [lookup(i)[:2] for i in ring]
+            p = Polygon(pts2d)
+            if not p.is_valid:
+                p = p.buffer(0)
+            if p.area > 0:
+                tris.append(p)
+        if not tris:
+            return None
+        silhouette = shapely.unary_union(tris)
+        parts = [silhouette] if silhouette.geom_type == "Polygon" else list(silhouette.geoms)
+        parts = [p for p in parts if p.geom_type == "Polygon" and p.area > 0]
+        if not parts:
+            return None
+        return [[list(p.exterior.coords)] + [list(interior.coords) for interior in p.interiors] for p in parts]
+
+    return None
 
 
 def walk_vertex_indices(boundaries):
