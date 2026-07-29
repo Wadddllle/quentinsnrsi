@@ -63,8 +63,10 @@ def _footprint_hull(base_pts_xy):
 
 
 def _extract_tile(uri, domain_polygon, archive):
-    """Decode one leaf tile -> list of per-_BATCHID building-piece dicts whose
-    centroid falls in domain_polygon. Runs on a worker thread."""
+    """Decode one leaf tile -> list of per-_BATCHID building-piece dicts. If
+    domain_polygon is given, keep only pieces whose centroid falls inside it
+    (domain_polygon=None keeps every piece -- used by the whole-island
+    precompute). Runs on a worker thread."""
     data = fetch_tile(uri) if archive is None else fetch_tile(uri, archive=archive)
     ft = feature_table(data)
     rtc = ft.get("RTC_CENTER")
@@ -85,25 +87,50 @@ def _extract_tile(uri, domain_polygon, archive):
             if np.ptp(v[:, 2]) < FLAT_PLATE_Z:
                 continue  # ground plate, not real volume
             cx, cy = v[:, 0].mean(), v[:, 1].mean()
-            if not contains_xy(domain_polygon, cx, cy):
+            if domain_polygon is not None and not contains_xy(domain_polygon, cx, cy):
                 continue
             remap = np.zeros(len(svy), dtype=np.int64)
             remap[used] = np.arange(len(used))
             base_z = float(v[:, 2].min())
             near_base = v[v[:, 2] <= base_z + 2.0][:, :2]
             out.append({
-                "verts": v.copy(),
-                "faces": remap[sub_faces],
+                "verts": v.astype(np.float32).copy(),
+                "faces": remap[sub_faces].astype(np.int32),
                 "base_z": base_z,
-                "footprint": _footprint_hull(near_base),
+                "footprint": (None if _footprint_hull(near_base) is None
+                              else _footprint_hull(near_base).astype(np.float32)),
             })
     return out
 
 
+def pieces_from_store(store_dir, tile_uri, domain_polygon=None):
+    """Load precomputed building pieces for one tile from the store, filtering
+    to domain_polygon by centroid if given. Returns [] if the tile isn't in the
+    store (caller can fall back to a live decode)."""
+    from sbg.onemap_native.tiles import _tile_uri_to_local_path
+    from pathlib import Path
+    p = _tile_uri_to_local_path(tile_uri, Path(store_dir)).with_suffix(".npy")
+    if not p.exists():
+        return []
+    pieces = list(np.load(p, allow_pickle=True))
+    if domain_polygon is None:
+        return pieces
+    out = []
+    for pc in pieces:
+        v = pc["verts"]
+        if contains_xy(domain_polygon, v[:, 0].mean(), v[:, 1].mean()):
+            out.append(pc)
+    return out
+
+
 def extract_domain_buildings(leaf_uris, domain_polygon, archive=None,
-                             workers=DEFAULT_WORKERS, progress=None):
-    """Extract every building piece whose centroid falls in domain_polygon,
-    decoding tiles in parallel.
+                             workers=DEFAULT_WORKERS, progress=None, store_dir=None):
+    """Extract every building piece whose centroid falls in domain_polygon.
+
+    If store_dir is given, pieces are loaded from the precomputed store (fast
+    local numpy read -- no b3dm fetch/decode/transform); any tile missing from
+    the store falls back to a live parallel decode. Otherwise every tile is
+    decoded live, in parallel.
 
     Returns a list of dicts, one per (tile, _BATCHID) piece:
         {"verts": (N,3) EPSG:3414, "faces": (M,3) local indices,
@@ -112,8 +139,25 @@ def extract_domain_buildings(leaf_uris, domain_polygon, archive=None,
     piece onto real terrain (see terrain.place_on_terrain). `progress`, if
     given, is called with (n_done, n_total) after each tile.
     """
-    pieces = []
     total = len(leaf_uris)
+    if store_dir is not None:
+        pieces, misses = [], []
+        for i, u in enumerate(leaf_uris, 1):
+            got = pieces_from_store(store_dir, u, domain_polygon)
+            if got:
+                pieces.extend(got)
+            elif not (_store_has_tile(store_dir, u)):
+                misses.append(u)  # genuinely absent -> live-decode fallback
+            if progress is not None:
+                progress(i, total)
+        if misses:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_extract_tile, u, domain_polygon, archive): u for u in misses}
+                for fut in as_completed(futs):
+                    pieces.extend(fut.result())
+        return pieces
+
+    pieces = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_extract_tile, u, domain_polygon, archive): u for u in leaf_uris}
         for i, fut in enumerate(as_completed(futs), 1):
@@ -121,3 +165,9 @@ def extract_domain_buildings(leaf_uris, domain_polygon, archive=None,
             if progress is not None:
                 progress(i, total)
     return pieces
+
+
+def _store_has_tile(store_dir, tile_uri):
+    from sbg.onemap_native.tiles import _tile_uri_to_local_path
+    from pathlib import Path
+    return _tile_uri_to_local_path(tile_uri, Path(store_dir)).with_suffix(".npy").exists()

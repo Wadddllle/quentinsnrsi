@@ -17,4 +17,6 @@ uvicorn
 orjson
 fast-simplification
 python-multipart
-rtree 
+rtree
+meshlib
+opencv-python  # cv2: fast scan-line pad rasterization in onemap_native/terrain.py (optional -- matplotlib fallback)
