@@ -39,6 +39,12 @@ from sbg.onemap_native.tiles import domain_leaf_tiles
 
 _svy_to_wgs = Transformer.from_crs("EPSG:3414", "EPSG:4326", always_xy=True)
 _FUSE_SCRIPT = Path(__file__).parent / "blender" / "fuse_stl.py"
+# Floating-debris removal. A disconnected component is a floating remesh sliver
+# (not a real building) if its BOTTOM sits above the local ground AND it's small.
+# Area alone doesn't discriminate (measured slivers are thin 17-56m^2 sheets, same
+# scale as a small building footprint) -- floating-vs-grounded is the real signal.
+DEBRIS_FLOAT_GAP_M = 2.0   # component z-min this far above local DTM ground => floating
+DEBRIS_MAX_FACES = 1000    # only drop SMALL floating bits; a large floating structure is kept
 
 
 def _write_scene_ply(terr_path, bld_path, terr_v, terr_f, bld_v, bld_f):
@@ -104,6 +110,21 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     log(f"[terrain] DTM {grid_z.shape} elev {np.nanmin(grid_z):.0f}-{np.nanmax(grid_z):.0f}m, "
         f"{len(footprints)} buildings placed")
 
+    # High-fidelity raw mode (voxel_size <= 0): skip the whole watertight machinery
+    # (Blender voxel remesh + meshlib decimate/clip/polish) and dump the terrain +
+    # real OneMap building meshes straight to STL. Preserves full LiDAR detail, is
+    # fast (no Blender), but is a non-watertight triangle soup -- for eyeballing the
+    # real geometry, not for CFD meshing.
+    if voxel_size is not None and voxel_size <= 0:
+        import trimesh
+        verts = np.vstack([terr_v, bld_v])
+        faces = np.vstack([terr_f, bld_f + len(terr_v)])
+        trimesh.Trimesh(verts, faces, process=False).export(str(out_stl))
+        log(f"[raw] high-fidelity NON-watertight mesh: {len(faces):,} faces "
+            f"(skipped fuse/decimate/clip/polish)")
+        log(f"[done] {out_stl}  (raw high-fidelity soup -- not watertight by design)")
+        return out_stl
+
     terr_ply = workdir / "terrain.ply"
     bld_ply = workdir / "buildings.ply"
     _write_scene_ply(terr_ply, bld_ply, terr_v, terr_f, bld_v, bld_f)
@@ -162,6 +183,35 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     holes = len(clipped.topology.findHoleRepresentiveEdges())
     log(f"[clip] watertight={holes == 0} (meshlib holes={holes}), "
         f"{clipped.topology.numValidFaces()} faces")
+
+    # Drop floating debris: the voxel remesh + boolean cut leave a few
+    # DISCONNECTED thin slivers floating in the air (measured ~4-5 per domain,
+    # 6-26 faces, 17-56m^2, hovering 6-60m up). Harmless for CFD (far below the ~3m
+    # grid) but dirty. A component is a floating sliver if its BOTTOM sits above the
+    # local DTM ground (grounded buildings penetrate the slab, so their z-min is at
+    # or below ground) AND it's small (a large floating structure -- rare, e.g. a
+    # captured skybridge -- is kept). Done HERE on the clean boolean output (real
+    # connected components), NOT on the reloaded STL soup below (whose components
+    # are welding artifacts). Deleting a whole disconnected component opens no
+    # boundary in the rest, so watertightness is preserved.
+    comps = mr.MeshComponents.getAllComponents(mr.MeshPart(clipped))
+    if len(comps) > 1:
+        largest = max(comps, key=lambda cc: cc.count())
+        drop = mr.FaceBitSet()
+        ndrop = 0
+        for comp in comps:
+            if comp is largest or comp.count() > DEBRIS_MAX_FACES:
+                continue
+            cb = clipped.computeBoundingBox(comp)
+            cx, cy = (cb.min.x + cb.max.x) / 2, (cb.min.y + cb.max.y) / 2
+            if cb.min.z > dtm(cx, cy) + DEBRIS_FLOAT_GAP_M:  # floats above local ground
+                drop |= comp
+                ndrop += 1
+        if drop.count():
+            clipped.deleteFaces(drop)
+            clipped.pack()
+            log(f"[debris] dropped {ndrop} floating slivers ({drop.count()} faces), "
+                f"{clipped.topology.numValidFaces()} faces remain")
 
     # Final polish: edge-collapse the handful of zero-area sliver faces the voxel
     # remesh + boolean cut leave behind (measured ~3-6 in >1.3M faces, at interior

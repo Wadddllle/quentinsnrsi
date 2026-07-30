@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -22,10 +23,10 @@ TRANSFORM_SCALE = 0.001  # 1mm quantization, far finer than source data needs
 LEVEL_HEIGHT = 3.2
 DEFAULT_HEIGHT = 3.2
 
-# Standalone Blender install used by sbg/ui/pipeline.py's STL job (see Phase 5
-# of the project plan) -- not `pip install bpy` (PyPI wheel pinned to a
-# Python version that clashes with this venv), not on PATH, invoked by full
-# path. Not user-configurable yet (see plan's own "settings screen with a
-# test button" follow-up) -- change this constant if Blender is reinstalled
-# elsewhere.
-BLENDER_PATH = Path.home() / "tools" / "blender-4.5.11-linux-x64" / "blender"
+# Standalone Blender install used by the STL pipeline -- not `pip install bpy`
+# (PyPI wheel pinned to a Python version that clashes with this venv), not on
+# PATH, invoked by full path. Overridable via the SBG_BLENDER_PATH env var (the
+# v2 UI's --blender flag sets it) for portability to another machine; falls back
+# to the standard local tarball install path.
+BLENDER_PATH = Path(os.environ.get("SBG_BLENDER_PATH")
+                    or Path.home() / "tools" / "blender-4.5.11-linux-x64" / "blender")

@@ -86,8 +86,15 @@ def _extract_tile(uri, domain_polygon, archive):
             v = svy[used]
             if np.ptp(v[:, 2]) < FLAT_PLATE_Z:
                 continue  # ground plate, not real volume
-            cx, cy = v[:, 0].mean(), v[:, 1].mean()
-            if domain_polygon is not None and not contains_xy(domain_polygon, cx, cy):
+            # Keep only buildings FULLY inside the domain (every vertex in), not
+            # just centroid-inside. A building whose centroid is inside but whose
+            # body pokes past the boundary would otherwise be SLICED flat by the
+            # meshlib box clip downstream -- the "every building sliced, half in
+            # half out" bug. Dropping crossing buildings instead is Deliverable
+            # 3's semantics ("remove buildings cut through by the domain
+            # boundary") and matches /api/domain/preview's "kept" (query_contained).
+            if domain_polygon is not None and not np.all(
+                    contains_xy(domain_polygon, v[:, 0], v[:, 1])):
                 continue
             remap = np.zeros(len(svy), dtype=np.int64)
             remap[used] = np.arange(len(used))
@@ -118,7 +125,7 @@ def pieces_from_store(store_dir, tile_uri, domain_polygon=None):
     out = []
     for pc in pieces:
         v = pc["verts"]
-        if contains_xy(domain_polygon, v[:, 0].mean(), v[:, 1].mean()):
+        if np.all(contains_xy(domain_polygon, v[:, 0], v[:, 1])):  # fully inside, not just centroid
             out.append(pc)
     return out
 
