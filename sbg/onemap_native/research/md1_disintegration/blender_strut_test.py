@@ -1,0 +1,13 @@
+import sys, bpy, bmesh
+out_dir = sys.argv[sys.argv.index("--")+1]
+bpy.ops.object.select_all(action="SELECT"); bpy.ops.object.delete()
+bpy.ops.wm.obj_import(filepath=f"{out_dir}/00_with_struts.obj", forward_axis="Y", up_axis="Z")
+obj = bpy.context.selected_objects[0]
+bpy.context.view_layer.objects.active = obj
+mod = obj.modifiers.new("weld","WELD"); mod.merge_threshold=0.02
+bpy.ops.object.modifier_apply(modifier=mod.name)
+rm = obj.modifiers.new("remesh","REMESH"); rm.mode='VOXEL'; rm.voxel_size=2.0
+bpy.ops.object.modifier_apply(modifier=rm.name)
+bm = bmesh.new(); bm.from_mesh(obj.data); vol = bm.calc_volume(signed=True); bm.free()
+bpy.ops.wm.stl_export(filepath=f"{out_dir}/ab_00_with_struts.stl", export_selected_objects=False)
+print(f"AB_RESULT 00_with_struts: faces={len(obj.data.polygons)} volume={vol:.1f} bbox={[round(x,1) for x in obj.dimensions]}", file=sys.stderr)

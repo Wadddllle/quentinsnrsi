@@ -51,7 +51,16 @@ def main():
     solidify = _arg("--solidify", 60.0, float)
     voxel = _arg("--voxel-size", 2.0, float)
     debris_faces = _arg("--debris-faces", 200, int)
-    skip_debris = "--skip-debris" in sys.argv[sys.argv.index("--") + 1:]
+    argv = sys.argv[sys.argv.index("--") + 1:]
+    skip_debris = "--skip-debris" in argv
+    # Terrain now arrives pre-solidified as a true flat-bottom-at-z=0 solid
+    # (sbg.onemap_native.terrain.terrain_flat_base_solid, done in Python before
+    # this script runs) rather than a fixed-thickness offset -- Blender's
+    # SOLIDIFY modifier only supports a uniform per-vertex thickness, which
+    # can't express "extrude to an absolute Z plane". Kept as an opt-out flag,
+    # not the new unconditional default, so the legacy single-OBJ path (which
+    # still hands over a bare terrain SHEET, not a solid) keeps working.
+    skip_terrain_solidify = "--skip-terrain-solidify" in argv
     clip_bbox = _arg("--clip-bbox", None)  # "xmin,ymin,xmax,ymax"
 
     t0 = [time.perf_counter()]
@@ -72,6 +81,13 @@ def main():
         before = set(bpy.context.scene.objects)
         bpy.ops.wm.ply_import(filepath=buildings_path, up_axis="Z", forward_axis="Y")
         buildings = [o for o in bpy.context.scene.objects if o not in before]
+    elif buildings_path:
+        # Buildings-only (no terrain object at all) -- scratch A/B path for
+        # testing whether terrain backing affects voxel-remesh disintegration
+        # (see the plan's Thread D/C investigation). Not the normal pipeline.
+        bpy.ops.wm.ply_import(filepath=buildings_path, up_axis="Z", forward_axis="Y")
+        terrain = None
+        buildings = list(bpy.context.scene.objects)
     else:  # legacy single-OBJ path
         bpy.ops.wm.obj_import(filepath=inp, forward_axis="Y", up_axis="Z")
         objs = list(bpy.context.scene.objects)
@@ -79,23 +95,32 @@ def main():
         if terrain is None:
             raise RuntimeError("no 'terrain' object found in input OBJ")
         buildings = [o for o in objs if o is not terrain]
-    print(f"terrain + {len(buildings)} building object(s)", file=sys.stderr)
+    print(f"terrain + {len(buildings)} building object(s)" if terrain else
+          f"buildings-only ({len(buildings)} object(s), no terrain)", file=sys.stderr)
     lap("import")
 
-    mod = terrain.modifiers.new(name="solidify", type="SOLIDIFY")
-    mod.thickness = solidify
-    mod.offset = -1.0
-    mod.use_rim = True
-    bpy.context.view_layer.objects.active = terrain
-    bpy.ops.object.modifier_apply(modifier=mod.name)
-    lap("solidify terrain")
+    if terrain is None:
+        pass
+    elif skip_terrain_solidify:
+        lap("solidify terrain (skipped -- pre-solidified input)")
+    else:
+        mod = terrain.modifiers.new(name="solidify", type="SOLIDIFY")
+        mod.thickness = solidify
+        mod.offset = -1.0
+        mod.use_rim = True
+        bpy.context.view_layer.objects.active = terrain
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+        lap("solidify terrain")
 
     bpy.ops.object.select_all(action="DESELECT")
-    terrain.select_set(True)
+    active = terrain if terrain is not None else buildings[0]
+    if terrain is not None:
+        terrain.select_set(True)
     for o in buildings:
         o.select_set(True)
-    bpy.context.view_layer.objects.active = terrain
-    bpy.ops.object.join()
+    bpy.context.view_layer.objects.active = active
+    if terrain is not None or len(buildings) > 1:
+        bpy.ops.object.join()
     soup = bpy.context.view_layer.objects.active
     print(f"  joined: {len(soup.data.polygons)} faces", file=sys.stderr)
     lap("join")

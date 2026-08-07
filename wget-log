@@ -1,0 +1,21 @@
+--2026-08-04 17:22:41--  https://openfoam.com/
+Resolving openfoam.com (openfoam.com)... 172.67.128.143, 104.21.2.12, 2606:4700:3037::6815:20c, ...
+Connecting to openfoam.com (openfoam.com)|172.67.128.143|:443... connected.
+HTTP request sent, awaiting response... 301 Moved Permanently
+Location: http://www.openfoam.com// [following]
+URL transformed to HTTPS due to an HSTS policy
+--2026-08-04 17:22:42--  https://www.openfoam.com//
+Resolving www.openfoam.com (www.openfoam.com)... 172.67.128.143, 104.21.2.12, 2606:4700:3032::ac43:808f, ...
+Connecting to www.openfoam.com (www.openfoam.com)|172.67.128.143|:443... connected.
+HTTP request sent, awaiting response... 302 Found
+Location: https://www.openfoam.com/ [following]
+--2026-08-04 17:22:44--  https://www.openfoam.com/
+Reusing existing connection to www.openfoam.com:443.
+HTTP request sent, awaiting response... 200 OK
+Length: unspecified [text/html]
+Saving to: ‘STDOUT’
+
+-                                                      [<=>                                                                                                            ]       0  --.-KB/s               -                                                      [ <=>                                                                                                           ]  16.35K  --.-KB/s    in 0.09s   
+
+
+Cannot write to ‘-’ (Success).

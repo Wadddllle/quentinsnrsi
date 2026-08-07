@@ -60,7 +60,7 @@ async function loadStl(url) {
     }
     geometry.computeVertexNormals();
     const material = new THREE.MeshStandardMaterial({
-      color: 0x9fb3d1, metalness: 0.1, roughness: 0.8, side: THREE.DoubleSide,
+      color: 0xd2d2d2, metalness: 0.0, roughness: 0.85, side: THREE.DoubleSide,
       flatShading: false,
     });
     meshObj = new THREE.Mesh(geometry, material);
@@ -85,14 +85,16 @@ function onResize() {
 onMounted(() => {
   const el = containerRef.value;
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0b1220);
+  // neutral grey, matching how a plain STL viewer renders -- the old navy/blue
+  // scheme tinted the model and made surface relief harder to read.
+  scene.background = new THREE.Color(0x3c3f43);
   const w = el.clientWidth, h = el.clientHeight;
   camera = new THREE.PerspectiveCamera(50, w / h, 1, 1e6);
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(w, h);
   el.appendChild(renderer.domElement);
 
-  const hemi = new THREE.HemisphereLight(0xbcd0ff, 0x33384a, 1.1);
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x707070, 1.0);
   scene.add(hemi);
   const dir = new THREE.DirectionalLight(0xffffff, 1.6);
   dir.position.set(1, -1, 2);
@@ -132,7 +134,7 @@ watch(() => props.url, (u) => { if (u) loadStl(u); });
 .stl-canvas :deep(canvas) { display: block; }
 .stl-overlay {
   position: absolute; top: 12px; left: 12px;
-  background: rgba(11, 18, 32, 0.8); padding: 6px 12px; border-radius: 6px;
+  background: rgba(30, 32, 34, 0.82); padding: 6px 12px; border-radius: 6px;
   border: 1px solid var(--border); color: var(--muted); font-size: 13px;
 }
 .stl-overlay.err { color: var(--danger); }

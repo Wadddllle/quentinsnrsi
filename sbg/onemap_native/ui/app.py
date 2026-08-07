@@ -29,7 +29,9 @@ WEBUI_DIST = Path(__file__).resolve().parents[3] / "webui-v2" / "dist"
 STL_JOBS_DIR = DATA_DIR / "v2_stl_jobs"
 # whitelist of build_domain_stl knobs a client may override (everything else uses
 # the tuned defaults from build.py)
-_BUILD_OPTS = {"step", "voxel_size", "target_reduction", "decimate_error", "workers"}
+_BUILD_OPTS = {"step", "voxel_size", "target_reduction", "decimate_error", "workers",
+               "include_base", "placement", "coupling_lambda"}
+_PLACEMENTS = ("group", "drape", "laplacian")
 
 
 def _domain_polygon(payload):
@@ -93,6 +95,10 @@ def create_app(store_dir=None, dev=False):
     def stl_run(payload: dict = Body(...)):
         poly = _domain_polygon(payload)
         opts = {k: v for k, v in (payload.get("options") or {}).items() if k in _BUILD_OPTS}
+        # placement is the one free-form string a client can send -- validate it
+        # here rather than letting an unknown value reach the pipeline.
+        if opts.get("placement") not in (None,) + _PLACEMENTS:
+            raise HTTPException(400, f"placement must be one of {_PLACEMENTS}")
         job = create_job(run_stl_job, poly, STL_JOBS_DIR,
                          store_dir=app.state.store_dir,
                          log_extra=f"domain area {poly.area/1e6:.3f} km^2", **opts)

@@ -21,7 +21,7 @@ const jobId = ref(null);
 let pollTimer = null;
 
 // --- power-user build options (whitelisted server-side in _BUILD_OPTS) ---
-const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, step: 5.0, workers: 6 };
+const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0 };
 const options = ref({ ...DEFAULT_OPTS });
 const showAdvanced = ref(false);
 const jobWasRaw = ref(false);           // did the current job run in raw (voxel<=0) mode
@@ -96,9 +96,13 @@ async function runPreview() {
 
 // --- generate STL ---
 async function generate() {
-  // coerce option values to numbers (v-model on number inputs can yield strings)
+  // coerce option values to numbers (v-model on number inputs can yield strings) --
+  // include_base is a real boolean and placement a real string, leave those alone.
+  const NON_NUMERIC = new Set(['include_base', 'placement']);
   const opts = {};
-  for (const [k, v] of Object.entries(options.value)) opts[k] = Number(v);
+  for (const [k, v] of Object.entries(options.value)) opts[k] = NON_NUMERIC.has(k) ? v : Number(v);
+  // lambda is meaningless outside laplacian mode -- don't send it and imply it did something
+  if (opts.placement !== 'laplacian') delete opts.coupling_lambda;
   jobWasRaw.value = rawMode.value;
   const res = await fetch('/api/stl/run', {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -227,13 +231,49 @@ const logTail = computed(() => (job.value?.log || []).slice(-6));
           <input type="number" step="0.01" min="0" max="0.999" v-model="options.target_reduction" :disabled="rawMode" />
           <small class="muted">Face-removal cap (0.97). The error above usually governs unless this binds first.</small>
         </label>
-        <label>DTM step (m)
-          <input type="number" step="1" min="1" v-model="options.step" />
-          <small class="muted">Terrain grid resolution.</small>
-        </label>
         <label>Workers
           <input type="number" step="1" min="1" v-model="options.workers" />
           <small class="muted">Parallel tile decode (only matters when fetching tiles live).</small>
+        </label>
+        <label>Building placement on slopes
+          <select v-model="options.placement">
+            <option value="group">Group connected</option>
+            <option value="drape">Drape — no grouping (default)</option>
+            <option value="laplacian">Soft coupling (λ)</option>
+          </select>
+          <small class="muted">
+            How buildings joined across a slope get levelled. There is no universally
+            right answer — two real cases measure identical terrain spread and want
+            opposite treatment.
+            <template v-if="options.placement === 'group'">
+              <b>Group:</b> bridge-linked buildings share one flat level and stay
+              coplanar; a string of blocks up a hill gets a terrace carved into the
+              hillside to hold that level.
+            </template>
+            <template v-else-if="options.placement === 'drape'">
+              <b>Drape:</b> every building sits on its own ground. Hillside strings
+              terrace correctly; anything joined by a bridge shears apart
+              (measured ~20m on a real pair).
+            </template>
+            <template v-else>
+              <b>Soft coupling:</b> connected buildings pull toward each other instead
+              of being forced level. Compact complexes stay flat, long chains ramp
+              gently — both resolve without being classified.
+            </template>
+          </small>
+        </label>
+        <label v-if="options.placement === 'laplacian'">Coupling λ
+          <input type="number" step="1" min="0" v-model="options.coupling_lambda" />
+          <small class="muted">
+            Higher = flatter / more grouped (∞ ≡ Group), lower = more terracing
+            (0 ≡ Drape). At 10 a real bridge-linked complex held to 0.96m of step
+            while a hillside string terraced 8.7m.
+          </small>
+        </label>
+        <label class="row" style="align-items: center; gap: 8px;">
+          <input type="checkbox" v-model="options.include_base" />
+          Include ground/terrain plane
+          <small class="muted">Off = buildings only, no ground plate. In the watertight path the terrain still backs the voxel remesh internally and is subtracted at the end; in raw (voxel 0) mode it is simply not written.</small>
         </label>
         <div class="row modal-actions">
           <button @click="resetOptions">Reset defaults</button>
@@ -299,6 +339,7 @@ a { text-decoration: none; }
 .modal h3 { margin: 0; font-size: 16px; }
 .modal label { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
 .modal label input { width: 120px; }
+.modal label select { width: 220px; padding: 3px; }
 .modal small { line-height: 1.35; }
 .modal-actions { justify-content: flex-end; margin-top: 4px; }
 </style>
