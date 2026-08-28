@@ -2,6 +2,9 @@
 /ninja/
 /onemap-slicer/
 /buildings.city/
+/fTetWild/
+/manifold/
+/ManifoldPlus/
 
 # --- Python ---
 __pycache__/

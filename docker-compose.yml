@@ -1,0 +1,23 @@
+services:
+  sbg:
+    build:
+      context: .
+      args:
+        # 0 = slim image, raw (--voxel-size 0) path only. 1 = + Blender, so the
+        # watertight path works too.
+        WITH_BLENDER: "1"
+    image: sbg:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # The two runtime data files (see README). Read-only where possible.
+      - ./sg_buildings_v5.geojson:/app/sg_buildings_v5.geojson:ro
+      # Writable: holds dtm.tif, the footprint cache, and STL job output.
+      - ./data:/app/data
+      # Optional speed-up: a precomputed piece store. Drop this and the OPTIONS
+      # line below to fetch tiles live from OneMap instead.
+      # - ./data/onemap_store:/app/data/onemap_store:ro
+    # command: >
+    #   python -m sbg.onemap_native.ui --host 0.0.0.0 --port 8000 --no-browser
+    #   --store data/onemap_store
+    restart: unless-stopped

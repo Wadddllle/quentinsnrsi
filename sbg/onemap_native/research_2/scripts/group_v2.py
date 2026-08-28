@@ -1,0 +1,590 @@
+"""EXPERIMENT v2. Fixes from the v1 post-mortem:
+  - ring comes from the SHELL'S OWN boundary loop (shell.outline()), so the CDT
+    constraint IS the mesh cut boundary by construction (v1 used a separate
+    section() call + buffer(0), which could never be guaranteed to agree)
+  - one shell per PIECE (v1 stacked a shell once per ring -> 55 duplicates)
+  - overlapping rings drop only the RING, never the whole building (v1 threw away
+    92/342 = 27% of buildings)
+  - STRtree built once (v1 rebuilt it inside the loop)
+  - VS=0.5, no decimation for the first run; per-stage timers.
+"""
+import sys, time, collections, numpy as np, trimesh
+sys.path.insert(0,"/home/quentin/snrsi")
+from shapely.geometry import box, Polygon
+from shapely.ops import unary_union
+from shapely.strtree import STRtree
+from shapely import contains, points as shp_points
+from pyproj import Transformer
+import triangle as _triangle
+from sbg.onemap_native import extract as EX
+from sbg.onemap_native.tiles import domain_leaf_tiles
+from sbg.onemap_native.terrain import (build_domain_dtm, DtmSampler, _densify_ring,
+                                       terrain_flat_base_solid)
+import meshlib.mrmeshpy as mr, meshlib.mrmeshnumpy as mn
+import mapbox_earcut as earcut
+SP="/tmp/claude-1001/-home-quentin-snrsi/e94fd686-4895-49c7-be10-7af85f471583/scratchpad/"
+import os
+VS=0.5; DZ=1.0
+DEC_ERR=float(os.environ.get('DEC_ERR','0.25'))  # 0 = no decimation at all
+SHRINK=0.0   # group remesh makes the shrink unnecessary
+GAP=float(os.environ.get('GAP','0.5'))
+ADDV_DEC=int(os.environ.get('ADDV_DEC','3'))
+METRIC=os.environ.get('METRIC','surface')          # 'vertex' (old) | 'surface' (exact)
+SPLIT_COMP=os.environ.get('SPLIT_COMP','1')=='1'   # split fused solid into components  # CDT vertex dedup precision, decimals
+
+_DEC_T=0.0
+
+_TFBS_ORIG = terrain_flat_base_solid
+def terrain_flat_base_solid(terr_v, terr_f, dom, base_z=0.0, terrain_step=10.0):
+    """FIX 1: the shipped version winds the WALL opposite to the top surface.
+    Isolated: flipping wall+cap -> 160 conflicts, flipping cap only -> 160,
+    flipping WALL ONLY -> 0. Verified against trimesh.repair.fix_winding, which
+    also reaches 0 and reports positive volume, so the wall was the inside-out part.
+    Applied here as a post-hoc flip of exactly the wall faces."""
+    v,f = _TFBS_ORIG(terr_v, terr_f, dom, base_z=base_z, terrain_step=terrain_step)
+    n_top = len(terr_f)
+    n_ring = len(_densify_ring(dom.exterior.coords, terrain_step))
+    n_wall = 2*n_ring
+    for it_ in dom.interiors:
+        n_wall += 2*len(_densify_ring(it_.coords, terrain_step))
+    def _w(vv,ff):
+        _,iv=np.unique(np.round(vv,4),axis=0,return_inverse=True)
+        w2=iv.reshape(-1)[ff]
+        w2=w2[(w2[:,0]!=w2[:,1])&(w2[:,1]!=w2[:,2])&(w2[:,0]!=w2[:,2])]
+        he=set(); c=0
+        for a_,b_,c_ in w2:
+            for x,y in ((a_,b_),(b_,c_),(c_,a_)):
+                if (x,y) in he: c+=1
+                he.add((x,y))
+        return c
+    print(f"  [TFBS] total={len(f)} n_top={n_top} n_wall={n_wall} added={len(f)-n_top} "
+          f"wind_before={_w(v,f)}", flush=True)
+    f = f.copy(); f[n_top:n_top+n_wall] = f[n_top:n_top+n_wall][:, ::-1]
+    print(f"  [TFBS] wind_after_wallflip={_w(v,f)}", flush=True)
+    return v, f
+
+SKIP=collections.Counter()
+def cap_small_loops(sh, pad, min_area=0.05):
+    """FIX 2 (v2): cap the shell's own bottom boundary loops that shell_rings
+    REJECTED (area <= min_area). Those never became a CDT constraint, so terrain
+    was never opened under them and their rim had nothing to attach to.
+
+    v1 appended NEW vertices for the cap. That welds positionally but leaves the
+    cap topologically detached, so it could not be oriented against the wall faces
+    it abuts -- measured 306-321 winding conflicts in 30 planar groups, one per cap.
+    v2 reuses the shell's OWN boundary vertex indices and derives orientation from
+    the adjacent wall's half-edge direction: a cap must traverse each shared edge
+    OPPOSITE to the face already using it. Appends faces only, no new vertices, no
+    meshlib round-trip (float32 at 29km = 2mm, would destroy the seam)."""
+    V = np.asarray(sh.vertices); F = np.asarray(sh.faces)
+    if len(F) == 0: return sh, 0
+    he = set()
+    for a, b, c in F:
+        he.add((a, b)); he.add((b, c)); he.add((c, a))
+    bnd = [(x, y) for (x, y) in he if (y, x) not in he]
+    if not bnd: return sh, 0
+    # Chain boundary half-edges into loops. v2 used one global `used` set, which
+    # silently truncated any loop sharing a vertex with an earlier one -- that is
+    # why 17 loops (134 edges) survived capping. Chain by EDGE instead, following
+    # each directed boundary edge exactly once.
+    from collections import defaultdict as _dd2
+    out_e = _dd2(list)
+    for x, y in bnd: out_e[x].append(y)
+    unused = set(bnd)
+    loops = []
+    while unused:
+        x0, y0 = next(iter(unused))
+        unused.discard((x0, y0))
+        loop = [x0, y0]; cur = y0
+        while True:
+            nxts = [t for t in out_e.get(cur, []) if (cur, t) in unused]
+            if not nxts: break
+            t = nxts[0]; unused.discard((cur, t))
+            if t == x0: break
+            loop.append(t); cur = t
+        if len(loop) >= 3: loops.append(loop)
+    SKIP["loops"] += len(loops)
+    add = []; ncap = 0
+    for loop in loops:
+        pts = V[loop]
+        if abs(float(np.median(pts[:, 2])) - pad) > 0.25:
+            SKIP["offplane"] += 1; continue
+        q = Polygon(pts[:, :2])
+        if not q.is_valid: q = q.buffer(0)
+        if q.is_empty or q.area > min_area:
+            SKIP["is_a_ring"] += 1; continue
+        ring = list(reversed(loop))                    # opposite to the wall's direction
+        xy = np.ascontiguousarray(V[ring][:, :2], dtype=np.float32)
+        try:
+            tri = earcut.triangulate_float32(
+                xy, np.array([len(ring)], dtype=np.uint32)).reshape(-1, 3)
+        except Exception:
+            tri = np.zeros((0, 3), dtype=np.int64)
+        if not len(tri):
+            # earcut returns nothing for a ZERO-AREA ring, and 17 such loops (3-4
+            # verts, hull area ~0) were left open by v2. They are degenerate slivers
+            # from the slice, not real openings. A plain fan closes them
+            # topologically; the faces are near-zero-area but closure is what the
+            # spec needs, and they stay manifold (verified).
+            tri = np.array([[0, i, i + 1] for i in range(1, len(ring) - 1)],
+                           dtype=np.int64)
+        if not len(tri):
+            SKIP["no_tri"] += 1; continue
+        idx = np.asarray(ring, dtype=np.int64)[tri]
+        # verify: no cap half-edge may duplicate one the shell already uses
+        conflict = any((int(t[i]), int(t[(i + 1) % 3])) in he
+                       for t in idx for i in range(3))
+        if conflict: idx = idx[:, ::-1]
+        add.append(idx); ncap += 1
+    if not add: return sh, 0
+    return trimesh.Trimesh(V, np.vstack([F, np.vstack(add)]), process=False), ncap
+
+
+def log(m): print(m, flush=True)
+
+def remesh(v,f):
+    src=mn.meshFromFacesVerts(np.asarray(f,np.int32),np.asarray(v,float))
+    g=mr.meshToLevelSet(mr.MeshPart(src),mr.AffineXf3f(),mr.Vector3f(VS,VS,VS),3.0)
+    st=mr.GridToMeshSettings(); st.voxelSize=mr.Vector3f(VS,VS,VS)
+    st.isoValue=0.0; st.adaptivity=0.0
+    res=mr.gridToMesh(g,st)
+    global _DEC_T
+    if DEC_ERR>0:
+        _t=time.time()
+        ds=mr.DecimateSettings(); ds.maxError=DEC_ERR; mr.decimateMesh(res,ds)
+        _DEC_T+=time.time()-_t
+    return mn.getNumpyVerts(res), np.asarray(mn.getNumpyFaces(res.topology))
+
+
+def cap_nonseam(sh, zc, tol=0.25):
+    """Fill boundary loops that aren't at the cut plane (holes in the building)."""
+    try:
+        m=mn.meshFromFacesVerts(np.asarray(sh.faces,np.int32),np.asarray(sh.vertices,float))
+        for _ in range(3):
+            eds=m.topology.findHoleRepresentiveEdges()
+            filled=False
+            for e in eds:
+                loop=m.topology.getLeftRing(e)
+                zs=[m.points.vec[m.topology.org(x)].z for x in loop] if hasattr(m,'points') else []
+                if zs and abs(float(np.median(zs))-zc)<=tol:
+                    continue           # this is the seam loop -- terrain closes it
+                try: mr.fillHole(m,e,mr.FillHoleParams()); filled=True
+                except Exception: pass
+            if not filled: break
+        v=mn.getNumpyVerts(m); f=np.asarray(mn.getNumpyFaces(m.topology))
+        return trimesh.Trimesh(v,f,process=False)
+    except Exception:
+        return sh
+
+
+def cap_nonseam(sh, pad, tol=1e-6):
+    """Cap boundary loops that are NOT the seam loop (holes in the building
+    surface, measured up to 5.7m from any ring). Triangulates in the loop's own
+    best-fit plane and APPENDS faces only -- never round-trips through meshlib,
+    whose float32 point storage shifts vertices ~1mm at EPSG:3414 coords and
+    destroys the exact seam (measured: exact matches 29441 -> 8092)."""
+    import mapbox_earcut as _ec
+    v=np.asarray(sh.vertices); f=np.asarray(sh.faces)
+    ed=np.sort(np.vstack([f[:,[0,1]],f[:,[1,2]],f[:,[0,2]]]),axis=1)
+    u,c=np.unique(ed,axis=0,return_counts=True)
+    b=u[c==1]
+    if not len(b): return sh
+    adj={}
+    for a_,b_ in b: adj.setdefault(a_,[]).append(b_); adj.setdefault(b_,[]).append(a_)
+    seen=set(); new=[]
+    for start in adj:
+        if start in seen: continue
+        loop=[start]; seen.add(start); cur=start; prev=None
+        while True:
+            nxt=[x for x in adj[cur] if x!=prev and x not in seen]
+            if not nxt: break
+            prev, cur = cur, nxt[0]
+            loop.append(cur); seen.add(cur)
+        if len(loop)<3: continue
+        pts=v[loop]
+        if np.all(np.abs(pts[:,2]-pad)<1e-6): continue     # seam loop: terrain closes it
+        ctr=pts.mean(axis=0)
+        _,_,vt=np.linalg.svd(pts-ctr)
+        p2=(pts-ctr)@vt[:2].T
+        try: tri=_ec.triangulate_float64(p2.reshape(-1,2), np.array([len(p2)]))
+        except Exception: continue
+        idx=np.asarray(loop)
+        for k in range(0,len(tri),3): new.append(idx[[tri[k],tri[k+1],tri[k+2]]])
+    if not new: return sh
+    return trimesh.Trimesh(v, np.vstack([f,np.array(new)]), process=False)
+
+def shell_rings(shell, zc, tol=1e-6):
+    """Polygons of the shell's OWN open boundary at the cut plane."""
+    try: ol=shell.outline()
+    except Exception: return []
+    out=[]
+    for e in ol.entities:
+        pts=ol.vertices[e.points]
+        if len(pts)<4: continue
+        if abs(float(np.median(pts[:,2]))-zc)>0.25: continue   # only the cut loop
+        q=Polygon(pts[:,:2])
+        # FIX: an outline that self-touches in XY (pinched/figure-8 slice profile)
+        # makes an INVALID Polygon. Dropping it silently kept the shell but left
+        # its bottom loop with no terrain to attach to -> open edges. Measured on
+        # Duxton: 8 invalid loops, 3 of them REAL buildings of 338/241/219 m^2.
+        # buffer(0) repairs the self-touch and returns valid geometry.
+        if not q.is_valid:
+            q = q.buffer(0)
+        for part in (q.geoms if q.geom_type == "MultiPolygon" else [q]):
+            if part.geom_type == "Polygon" and part.is_valid and part.area > 0.05:
+                out.append(Polygon(part.exterior))
+    return out
+
+
+def _one(m, items, dtm):
+    """Slice ONE solid, build its rings, place it on its own pad."""
+    zc=float(m.vertices[:,2].min())+DZ
+    sh=m.slice_plane([0,0,zc],[0,0,1],cap=False)
+    if sh is None or len(sh.faces)<4: return False
+    sh=trimesh.Trimesh(sh.vertices.copy(),sh.faces.copy(),process=False)
+    sh.merge_vertices()
+    sh.vertices=np.round(sh.vertices,ADDV_DEC); sh.merge_vertices()
+    loops=shell_rings(sh,zc)
+    if not loops: return False
+    loops=sorted(loops,key=lambda q:-q.area); rings=[]; used=[False]*len(loops)
+    for a2,q in enumerate(loops):
+        if used[a2]: continue
+        holes=[]
+        for b2 in range(a2+1,len(loops)):
+            if not used[b2] and q.contains(loops[b2].representative_point()):
+                holes.append(list(loops[b2].exterior.coords)); used[b2]=True
+        rings.append(Polygon(list(q.exterior.coords),holes) if holes else q)
+        used[a2]=True
+    xy=np.vstack([np.asarray(q.exterior.coords) for q in rings])
+    pad=round(float(np.min(np.atleast_1d(dtm(xy[:,0],xy[:,1])))),ADDV_DEC)
+    sh.vertices[:,2]=np.round(sh.vertices[:,2]+(pad-zc),ADDV_DEC)
+    sh=cap_nonseam(sh,pad)
+    items.append({"rings":rings,"pad":pad,"shell":sh})
+    return True
+
+
+def main(B):
+    T0=time.time(); dom=box(*B)
+    tf=Transformer.from_crs("EPSG:3414","EPSG:4326",always_xy=True)
+    lo,la=tf.transform([B[0],B[2]],[B[1],B[3]])
+    t=time.time()
+    pieces=EX.extract_domain_buildings(domain_leaf_tiles(min(lo),min(la),max(lo),max(la)),
+                                       dom, store_dir="/home/quentin/snrsi/data/onemap_store")
+    gz,af=build_domain_dtm(B,step=5.0); dtm=DtmSampler(gz,af)
+    log(f"[extract] {len(pieces)} pieces, DTM {gz.shape}  {time.time()-t:.1f}s")
+
+    # ================= GROUP REMESH (replaces per-piece remesh + shrink + boolean union) =====
+    # Group buildings by REAL mesh-surface proximity, then build ONE level set per
+    # group. Party walls fuse by construction, so there is no 5cm shrink and no
+    # boolean union. Measured feasible: CBD 2km -> 542 groups, max 161 members,
+    # worst group bbox 1.11GB dense (vs 30GB whole-domain).
+    t=time.time(); sealed=[]
+    for p_ in pieces:
+        try:
+            sv,sf=EX.seal_piece(p_["verts"],p_["faces"])
+            sealed.append((np.asarray(sv,float),np.asarray(sf,np.int32)))
+        except Exception:
+            sealed.append(None)
+    keep=[i for i,x in enumerate(sealed) if x is not None and len(x[1])>=4]
+    log(f"[seal] {len(keep)}/{len(pieces)} pieces sealed  {time.time()-t:.1f}s")
+
+    t=time.time()
+    from scipy.spatial import cKDTree as _KD
+    import scipy.sparse as _sp
+    from scipy.sparse.csgraph import connected_components as _cc
+    bb=np.array([[sealed[i][0][:,0].min(),sealed[i][0][:,1].min(),sealed[i][0][:,2].min(),
+                  sealed[i][0][:,0].max(),sealed[i][0][:,1].max(),sealed[i][0][:,2].max()]
+                 for i in keep])
+    from sbg.onemap_native.terrain import _surface_gap as _SG
+    n=len(keep); ii=[]; jj=[]
+    fbb=[]
+    for i in keep:
+        v_,f_=sealed[i]; t_=v_[f_]
+        fbb.append((t_.min(axis=1), t_.max(axis=1)))
+    from shapely.geometry import box as _bx2
+    _boxes=[_bx2(bb[a,0]-GAP,bb[a,1]-GAP,bb[a,3]+GAP,bb[a,4]+GAP) for a in range(n)]
+    _tr=STRtree(_boxes); _npair=0; _acc=0
+    trees=[_KD(sealed[i][0]) for i in keep] if METRIC=='vertex' else None
+    for a in range(n):
+        for b in _tr.query(_boxes[a]):
+            b=int(b)
+            if b<=a: continue
+            if bb[a,2]-bb[b,5]>GAP or bb[b,2]-bb[a,5]>GAP: continue
+            _npair+=1
+            if METRIC=='vertex':
+                d,_=trees[b].query(sealed[keep[a]][0], distance_upper_bound=GAP)
+                hit=bool(np.isfinite(d).any())
+            else:
+                # Vertex-vertex is an UPPER bound; on these meshes (7-12m triangles,
+                # max 98m) it over-reports by up to 87x, so two interpenetrating
+                # buildings can have nearest VERTICES metres apart, never merge, and
+                # their two closed shells intersect in the assembly.
+                hit = _SG(sealed[keep[a]][0], sealed[keep[a]][1],
+                          sealed[keep[b]][0], sealed[keep[b]][1],
+                          GAP, bba=fbb[a], bbb=fbb[b]) <= GAP
+            if hit: ii.append(a); jj.append(b); _acc+=1
+    log(f"[group] metric={METRIC}: {_npair} candidate pairs -> {_acc} merged")
+    del fbb
+    lbl=np.arange(n)
+    if ii:
+        _g=_sp.coo_matrix((np.ones(len(ii)),(ii,jj)),shape=(n,n))
+        _,lbl=_cc(_g,directed=False)
+    uq_g=np.unique(lbl); ngrp=len(uq_g)
+    gsz=np.bincount(lbl)
+    log(f"[group] {ngrp} proximity groups (gap<{GAP}m), max members={gsz.max()}, "
+        f"multi-member={int((gsz>1).sum())}  {time.time()-t:.1f}s")
+
+    trees=None
+    import gc as _gc; _gc.collect()
+    t=time.time(); items=[]; nfail=0; _nsolid=0
+    for gi,g_ in enumerate(uq_g):
+        if gi%25==0: log(f"   ...group {gi}/{ngrp}  ({time.time()-t:.0f}s)")
+        mem=[keep[k] for k in np.where(lbl==g_)[0]]
+        V=[]; F=[]; off=0
+        for i in mem:
+            v_,f_=sealed[i]
+            V.append(v_); F.append(f_+off); off+=len(v_)
+        gv=np.vstack(V); gf=np.vstack(F)
+        for i in mem: sealed[i]=None      # consumed; free it
+        del V, F
+        try:
+            rv,rf=remesh(gv,gf)          # ONE level set for the whole voxel BATCH
+            m0=trimesh.Trimesh(rv,rf,process=True); m0.merge_vertices()
+            # A group is a VOXEL BATCH, not necessarily one solid. Slicing the whole
+            # batch forces one cut plane and one pad_z = min DTM over every member,
+            # which sinks members on higher ground -- the building-vs-terrain self-X
+            # class (92% of Duxton's residual). Split first so each real solid gets
+            # its own plane and pad.
+            parts=[m0]
+            if SPLIT_COMP:
+                try:
+                    cs=[trimesh.Trimesh(c.vertices.copy(),c.faces.copy(),process=False)
+                        for c in m0.split(only_watertight=False)]
+                    cs=[c for c in cs if len(c.faces)>=4]
+                    if cs: parts=cs
+                except Exception:
+                    pass
+            for m in parts:
+                _one(m, items, dtm)
+            _nsolid+=len(parts)
+            continue
+            zc=float(m.vertices[:,2].min())+DZ
+            sh=m.slice_plane([0,0,zc],[0,0,1],cap=False)
+            if sh is None or len(sh.faces)<4: nfail+=1; continue
+            sh=trimesh.Trimesh(sh.vertices.copy(),sh.faces.copy(),process=False)
+            sh.merge_vertices()
+            sh.vertices=np.round(sh.vertices,ADDV_DEC); sh.merge_vertices()
+            loops=shell_rings(sh,zc)
+            if not loops: nfail+=1; continue
+            loops=sorted(loops,key=lambda q:-q.area); rings=[]; used=[False]*len(loops)
+            for a2,q in enumerate(loops):
+                if used[a2]: continue
+                holes=[]
+                for b2 in range(a2+1,len(loops)):
+                    if not used[b2] and q.contains(loops[b2].representative_point()):
+                        holes.append(list(loops[b2].exterior.coords)); used[b2]=True
+                rings.append(Polygon(list(q.exterior.coords),holes) if holes else q)
+                used[a2]=True
+            xy=np.vstack([np.asarray(q.exterior.coords) for q in rings])
+            pad=round(float(np.min(np.atleast_1d(dtm(xy[:,0],xy[:,1])))),ADDV_DEC)
+            sh.vertices[:,2]=np.round(sh.vertices[:,2]+(pad-zc),ADDV_DEC)
+            sh=cap_nonseam(sh,pad)
+            items.append({"rings":rings,"pad":pad,"shell":sh})
+        except Exception as e:
+            nfail+=1
+        finally:
+            _gc.collect()
+    log(f"[group-remesh] {_nsolid} solids from {ngrp} batches -> {len(items)} placed, {nfail} failed  {time.time()-t:.1f}s "
+        f"(decimate {_DEC_T:.1f}s)")
+
+    t=time.time(); rings=[]; padz=[]; taken=[]
+    for it in items:
+        for q in it["rings"]:
+            rings.append(q); padz.append(it["pad"]); taken.append(q)
+    tree=STRtree(taken); bad=set()
+    for i,q in enumerate(taken):
+        if i in bad: continue
+        for j in tree.query(q):
+            j=int(j)
+            if j<=i or j in bad: continue
+            if q.intersection(taken[j]).area>1e-6: bad.add(j)   # drop only the RING
+    rings=[q for i,q in enumerate(rings) if i not in bad]
+    padz=[z for i,z in enumerate(padz) if i not in bad]
+    log(f"[rings] {len(rings)} constraints, {len(bad)} overlapping rings dropped "
+        f"(buildings kept: {len(items)})  {time.time()-t:.1f}s")
+
+    t=time.time()
+    tv,tt=conf_holed(dom,dtm,rings,padz)
+    log(f"[terrain] {len(tt):,} triangles  {time.time()-t:.1f}s")
+    def _sx(v,f,tag):
+        v=np.asarray(v,float); f=np.asarray(f)
+        uq,inv=np.unique(np.round(v,4),axis=0,return_inverse=True)
+        wf=inv.reshape(-1)[f]
+        wf=wf[(wf[:,0]!=wf[:,1])&(wf[:,1]!=wf[:,2])&(wf[:,0]!=wf[:,2])]
+        ml=mn.meshFromFacesVerts(np.asarray(wf,np.int32),np.asarray(uq,float))
+        print(f"SRC {tag:34s} faces={len(wf):>8,} selfX={mr.findSelfCollidingTriangles(mr.MeshPart(ml)).size()}",flush=True)
+    _av=[];_af=[];_n=0
+    for _it in items:
+        _av.append(np.asarray(_it["shell"].vertices)); _af.append(np.asarray(_it["shell"].faces)+_n)
+        _n+=len(_it["shell"].vertices)
+    _sx(np.vstack(_av),np.vstack(_af),"SHELLS only (no terrain)")
+    for _k,_it in enumerate(items):
+        _s=_it["shell"]
+        _sx(_s.vertices,_s.faces,f"single group #{_k}") if _k<3 else None
+    _nc=0
+    for _it in items:
+        _it["shell"], _k = cap_small_loops(_it["shell"], _it["pad"])
+        _nc += _k
+    log(f"[cap] capped {_nc} loops; skips={dict(SKIP)}")
+    t=time.time()
+    shells=[it["shell"] for it in items]
+    bmin=min(float(s.vertices[:,2].min()) for s in shells)
+    sv2,sf2=terrain_flat_base_solid(tv,tt,dom,base_z=min(0.0,bmin-1.0),terrain_step=10.0)
+    V=[sv2]; F=[sf2]; n=len(sv2)
+    for s in shells:
+        V.append(np.asarray(s.vertices)); F.append(np.asarray(s.faces)+n); n+=len(s.vertices)
+    allv=np.vstack(V); allf=np.vstack(F)
+    log(f"[assemble] {len(allf):,} faces  {time.time()-t:.1f}s")
+
+    # ---- SEAM DIAGNOSTIC: terrain hole boundary vs shell bottom boundary ----
+    def _openedges(v,f):
+        ed=np.sort(np.vstack([f[:,[0,1]],f[:,[1,2]],f[:,[0,2]]]),axis=1)
+        u,c=np.unique(ed,axis=0,return_counts=True)
+        return u[c==1]
+    te=_openedges(sv2,sf2)
+    tp=np.round(sv2[np.unique(te)],3) if len(te) else np.zeros((0,3))
+    se=[]; sp=[]
+    for s_ in shells:
+        vv=np.asarray(s_.vertices); ff=np.asarray(s_.faces)
+        o=_openedges(vv,ff)
+        se.append(len(o))
+        if len(o): sp.append(np.round(vv[np.unique(o)],3))
+    sp=np.vstack(sp) if sp else np.zeros((0,3))
+    log(f"[seam] terrain solid open edges={len(te)} (verts {len(tp)}) | "
+        f"shells open edges={sum(se)} (verts {len(sp)})")
+    if len(tp) and len(sp):
+        from scipy.spatial import cKDTree as _KD
+        d1,_=_KD(tp).query(sp)
+        log(f"[seam] shell-boundary vert -> nearest terrain-hole vert: "
+            f"exact={int((d1<1e-9).sum())}/{len(sp)} <1mm={int((d1<1e-3).sum())} "
+            f"median={np.median(d1):.4f}m p90={np.percentile(d1,90):.4f}m max={d1.max():.3f}m")
+        d2,_=_KD(sp).query(tp)
+        log(f"[seam] terrain-hole vert -> nearest shell vert: "
+            f"exact={int((d2<1e-9).sum())}/{len(tp)} <1mm={int((d2<1e-3).sum())} "
+            f"max={d2.max():.3f}m")
+    t=time.time()
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    key=np.round(allv,4)
+    _,uidx,inv=np.unique(key,axis=0,return_index=True,return_inverse=True)
+    inv=inv.reshape(-1)
+    wf=inv[allf]
+    wf=wf[(wf[:,0]!=wf[:,1])&(wf[:,1]!=wf[:,2])&(wf[:,0]!=wf[:,2])]
+    ed=np.sort(np.vstack([wf[:,[0,1]],wf[:,[1,2]],wf[:,[0,2]]]),axis=1)
+    _,cnt=np.unique(ed,axis=0,return_counts=True)
+    nv=len(uidx)
+    g=coo_matrix((np.ones(len(ed)),(ed[:,0],ed[:,1])),shape=(nv,nv))
+    ncomp,_=connected_components(g,directed=False)
+    log(f"[verify] faces={len(wf):,} verts={nv:,} components={ncomp} "
+        f"openEdges={int((cnt==1).sum())} nonManifoldEdges={int((cnt>2).sum())} "
+        f"allEdgesTwice={(cnt==2).all()}  {time.time()-t:.1f}s")
+    try:
+        mm=mn.meshFromFacesVerts(np.asarray(wf,np.int32),np.asarray(allv[uidx],float))
+        log(f"[verify] selfIntersectingTris={mr.findSelfCollidingTriangles(mr.MeshPart(mm)).size()}")
+    except Exception as ex: log(f"[verify] selfX check failed: {ex!r}")
+    def FULLAUDIT(v,f,tag):
+        """Vectorised. The Python half-edge set held ~27M tuples at 9M faces and
+        pushed RSS past 6.5GB; numpy does the same job in a few hundred MB."""
+        v=np.asarray(v,float); f=np.asarray(f)
+        uq,inv=np.unique(np.round(v,4),axis=0,return_inverse=True)
+        wf=inv.reshape(-1)[f]
+        wf=wf[(wf[:,0]!=wf[:,1])&(wf[:,1]!=wf[:,2])&(wf[:,0]!=wf[:,2])]
+        und=np.sort(np.vstack([wf[:,[0,1]],wf[:,[1,2]],wf[:,[0,2]]]),axis=1)
+        _,cnt=np.unique(und,axis=0,return_counts=True)
+        nb=int((cnt==1).sum()); nnm=int((cnt>2).sum())
+        del und
+        dire=np.vstack([wf[:,[0,1]],wf[:,[1,2]],wf[:,[2,0]]])
+        _,dc=np.unique(dire,axis=0,return_counts=True)
+        wind=int((dc-1)[dc>1].sum())
+        del dire,dc
+        bow="skipped(>2M faces)"
+        if len(wf)<=2_000_000:
+            from collections import defaultdict as _dd3
+            link=_dd3(list)
+            for a_,b_,c_ in wf:
+                link[a_].append((b_,c_)); link[b_].append((c_,a_)); link[c_].append((a_,b_))
+            nbow=0
+            for _vt,es in link.items():
+                adj=_dd3(list)
+                for x,y in es: adj[x].append(y); adj[y].append(x)
+                seen=set(); comps=0
+                for s0 in adj:
+                    if s0 in seen: continue
+                    comps+=1; st=[s0]; seen.add(s0)
+                    while st:
+                        n_=st.pop()
+                        for k in adj[n_]:
+                            if k not in seen: seen.add(k); st.append(k)
+                if comps>1: nbow+=1
+            bow=str(nbow); del link
+        if len(wf)>3_000_000 and os.environ.get("SKIP_SELFX","1")=="1":
+            nsx="skipped(>3M)"
+        else:
+            ml=mn.meshFromFacesVerts(np.asarray(wf,np.int32),np.asarray(uq,float))
+            nsx=mr.findSelfCollidingTriangles(mr.MeshPart(ml)).size()
+        print(f"RESULT {tag} | faces={len(wf):,} | closed={'YES' if nb==0 else 'NO('+str(nb)+')'}"
+              f" | NM={nnm} | bowtie={bow} | wind={wind} | selfX={nsx}",flush=True)
+    FULLAUDIT(allv,allf,f"DOMAIN={os.environ.get('DOM','?')} ASSEMBLY")
+    _ctr = allv.mean(axis=0)
+    trimesh.Trimesh(allv - _ctr, allf, process=False).export(SP+f"GROUPREMESH_{os.environ.get('DOM','duxton')}.stl")
+    np.save(SP+"SLICECDT4_origin.npy", _ctr)
+    pass
+    log(f"[done] {time.time()-T0:.0f}s -> SLICECDT2_duxton.stl")
+
+def conf_holed(domain_polygon,dtm,rings,padz,terrain_step=10.0):
+    collar=max(terrain_step/2,1.0)
+    union=unary_union(rings) if rings else None
+    xmin,ymin,xmax,ymax=domain_polygon.bounds
+    gx,gy=np.meshgrid(np.arange(xmin,xmax+terrain_step,terrain_step),
+                      np.arange(ymin,ymax+terrain_step,terrain_step))
+    pts=np.column_stack([gx.ravel(),gy.ravel()])
+    geoms=shp_points(pts[:,0],pts[:,1]); keep=contains(domain_polygon,geoms)
+    if union is not None and not union.is_empty:
+        keep &= ~contains(union.buffer(collar),geoms)
+    grid=pts[keep]
+    verts,zs,vidx=[],[],{}
+    def add_v(x,y,z):
+        k=(round(x,ADDV_DEC),round(y,ADDV_DEC)); i=vidx.get(k)
+        if i is None: i=len(verts); vidx[k]=i; verts.append((x,y)); zs.append(z)
+        return i
+    segs=[]
+    def add_ring(coords,pad):
+        ring=coords[:-1] if coords[0]==coords[-1] else coords
+        ids=[add_v(x,y,pad if pad is not None else float(dtm(x,y))) for x,y in ring]
+        for i in range(len(ids)): segs.append((ids[i],ids[(i+1)%len(ids)]))
+    add_ring(_densify_ring(domain_polygon.exterior.coords,terrain_step),None)
+    holes=[]
+    for q,pz in zip(rings,padz):
+        add_ring(list(q.exterior.coords),pz)
+        for it_ in q.interiors: add_ring(list(it_.coords),pz)
+        rp=q.representative_point()   # inside the ANNULUS for a polygon with holes
+        holes.append((rp.x,rp.y))
+    for x,y in grid: add_v(float(x),float(y),float(dtm(x,y)))
+    verts=np.array(verts,float); zs=np.array(zs,float); origin=verts.min(axis=0)
+    d={"vertices":verts-origin,"segments":np.array(segs,int)}
+    if holes: d["holes"]=np.array(holes,float)-origin
+    out=_triangle.triangulate(d,"pYY")  # YY: no Steiner points on ANY segment
+    # ("Y" alone only protects the OUTER boundary -- building rings are interior
+    #  segments, so Triangle was free to split them, unpairing the seam)
+    if "triangles" not in out: raise RuntimeError("triangle produced nothing")
+    tv=out["vertices"]+origin
+    allz = zs if len(tv)<=len(verts) else np.concatenate(
+        [zs,np.atleast_1d(dtm(tv[len(verts):,0],tv[len(verts):,1]))])
+    return np.column_stack([tv,allz]), out["triangles"].astype(np.int64)
+
+if __name__=="__main__":
+    _D={"duxton":(28941,28758,29341,29158),
+        "kentridge":(21950,30250,22850,31150),
+        "cbd2km":(28500,28500,30500,30500),
+        "queenstown":(25300,28500,27700,30500)}
+    main(_D[os.environ.get("DOM","duxton")])

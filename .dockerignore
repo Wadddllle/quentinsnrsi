@@ -1,0 +1,27 @@
+# Big local data / generated artefacts -- mounted at runtime, never baked in
+data/
+ssd-data/
+onemap_full_scrape/
+onemap_landmarks/
+*.geojson
+*.stl
+*.city.json
+hdb.json
+
+# Vendored reference repos (own .git, not part of this project's code)
+ninja/
+onemap-slicer/
+buildings.city/
+webui/
+
+# Build/venv/editor junk
+.venv/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+.git/
+.claude/
+doc/
+*.ipynb
+Miniconda3-latest-Linux-x86_64.sh
+pcdopenmcshit/

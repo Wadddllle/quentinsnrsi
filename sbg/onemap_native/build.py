@@ -20,6 +20,7 @@ Usage:
       --domain-geojson domain.geojson -o out.stl --voxel-size 2.0
 """
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,44 @@ _FUSE_SCRIPT = Path(__file__).parent / "blender" / "fuse_stl.py"
 # scale as a small building footprint) -- floating-vs-grounded is the real signal.
 DEBRIS_FLOAT_GAP_M = 2.0   # component z-min this far above local DTM ground => floating
 DEBRIS_MAX_FACES = 1000    # only drop SMALL floating bits; a large floating structure is kept
+
+
+def _fuse_meshlib(terr_v, terr_f, bld_v, bld_f, voxel_size, log):
+    """Voxel-remesh the terrain+buildings soup with meshlib instead of Blender.
+
+    Blender's REMESH(VOXEL) modifier and meshlib's offsetMesh(offset=0) both call
+    OpenVDB, so this is the same algorithm without the ~300 MB dependency. A/B on a
+    real production intermediate (Kent Ridge 900 m, terrain.ply + buildings.ply from
+    this very function's inputs) -- see research_2/scripts/fuse_ab.py:
+
+        Blender REMESH        3.4s  1,300,768 faces  holes 0  comps 5  selfX 0  37,385,263 m^3
+        offsetMesh OpenVDB    0.8s  1,300,768 faces  holes 0  comps 5  selfX 0  37,385,264 m^3
+
+    Identical face count; volume differs by 1 m^3 in 37.4 million (3e-6%). 4.25x faster.
+
+    signDetectionMode MUST be OpenVDB. Measured on the same input: Unsigned returns
+    ZERO faces; HoleWindingRule takes 159 s and fragments into 429 components with a
+    12% volume error. mcOffsetMesh (standard rather than dual marching cubes) yields
+    1 component instead of 5 but introduces 75 self-intersections -- not worth it.
+
+    The input soup is deliberately NOT closed (buildings plunged into a terrain slab,
+    overlaps left in -- that is the whole point of remeshing rather than booleaning),
+    which is exactly why sign detection has to come from OpenVDB's flood fill.
+    """
+    import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mn
+
+    verts = np.vstack([terr_v, bld_v])
+    faces = np.vstack([terr_f, bld_f + len(terr_v)])
+    src = mn.meshFromFacesVerts(np.ascontiguousarray(faces, np.int32),
+                                np.ascontiguousarray(verts, float))
+    log(f"[fuse] meshlib voxel remesh {voxel_size}m over {len(faces):,} soup faces...")
+    p = mr.OffsetParameters()
+    p.voxelSize = voxel_size
+    p.signDetectionMode = mr.SignDetectionMode.OpenVDB
+    out = mr.offsetMesh(mr.MeshPart(src), 0.0, p)
+    log(f"[fuse] meshlib fuse done: {out.topology.numValidFaces():,} faces")
+    return out
 
 
 def _write_scene_ply(terr_path, bld_path, terr_v, terr_f, bld_v, bld_f):
@@ -78,6 +117,7 @@ def _polygon_clip_solid(domain_polygon, z_lo, z_hi):
 def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
                      target_reduction=0.97, decimate_error=2.5, workers=6,
                      store_dir=None, workdir=None, log=None, include_base=True,
+                     fuse_backend="meshlib",
                      placement="drape", coupling_lambda=None):
     """Run the full tile-native pipeline for one domain polygon (EPSG:3414)."""
     import time
@@ -187,39 +227,50 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
         log(f"[done] {out_stl}  (raw high-fidelity soup -- not watertight by design)")
         return out_stl
 
-    terr_ply = workdir / "terrain.ply"
-    bld_ply = workdir / "buildings.ply"
-    _write_scene_ply(terr_ply, bld_ply, terr_v, terr_f, bld_v, bld_f)
-    log(f"[scene] wrote terrain+buildings PLY "
-        f"({(terr_ply.stat().st_size + bld_ply.stat().st_size) / 1e6:.0f} MB)")
-    # free the big geometry arrays before spawning Blender -- keeps this process's
-    # RSS low while Blender does its (memory-heavy) voxel remesh in a subprocess.
-    # Terrain is the one exception when include_base=False: it's needed again
-    # at the very end (boolean-subtracted from the final export) and MUST come
-    # from these original in-memory arrays, not a PLY round-trip -- reloading
-    # the exported terrain.ply back from disk was tried first and came back
-    # with real defects (holes=4, multiEdges=True) that were never present in
-    # the in-memory mesh, apparently introduced by the binary PLY export/
-    # reload's float32 precision loss on coincident boundary/wall vertices.
-    _terr_v_keep, _terr_f_keep = (terr_v, terr_f) if not include_base else (None, None)
-    del terr_v, terr_f, bld_v, bld_f, pieces
-    import gc
-    gc.collect()
+    import meshlib.mrmeshpy as mr
 
-    # Fuse to PLY (welded/indexed) not STL (per-triangle soup). The voxel-remesh
-    # output is perfectly watertight; STL un-welds it and re-welding in trimesh
-    # manufactures hundreds of SPURIOUS non-manifold edges. PLY carries Blender's
-    # clean welding straight through.
-    raw_ply = workdir / "fused.ply"
-    log(f"[blender] fusing (join + voxel remesh {voxel_size}m -> watertight PLY)...")
-    subprocess.run(
-        [str(BLENDER_PATH), "--background", "--python", str(_FUSE_SCRIPT), "--",
-         "--terrain", str(terr_ply), "--buildings", str(bld_ply), "--output", str(raw_ply),
-         "--voxel-size", str(voxel_size), "--skip-terrain-solidify",
-         "--skip-debris"],  # trimesh clip's keep-largest handles debris; skip the ~30s Blender split
-        check=True,
-    )
-    log(f"[blender] fuse done")
+    # Terrain is needed again at the very end when include_base=False (it gets
+    # boolean-subtracted from the final export) and MUST come from these original
+    # in-memory arrays, not a PLY round-trip -- reloading the exported terrain.ply
+    # was tried first and came back with real defects (holes=4, multiEdges=True)
+    # that were never present in memory, from binary PLY float32 precision loss on
+    # coincident boundary/wall vertices.
+    _terr_v_keep, _terr_f_keep = (terr_v, terr_f) if not include_base else (None, None)
+
+    if fuse_backend == "meshlib":
+        # No subprocess, no PLY round-trip, no Blender install. Same OpenVDB
+        # algorithm Blender's REMESH modifier uses -- see _fuse_meshlib.
+        mesh = _fuse_meshlib(terr_v, terr_f, bld_v, bld_f, voxel_size, log)
+        del terr_v, terr_f, bld_v, bld_f, pieces
+        import gc
+        gc.collect()
+    else:
+        terr_ply = workdir / "terrain.ply"
+        bld_ply = workdir / "buildings.ply"
+        _write_scene_ply(terr_ply, bld_ply, terr_v, terr_f, bld_v, bld_f)
+        log(f"[scene] wrote terrain+buildings PLY "
+            f"({(terr_ply.stat().st_size + bld_ply.stat().st_size) / 1e6:.0f} MB)")
+        # free the big geometry arrays before spawning Blender -- keeps this
+        # process's RSS low while Blender does its memory-heavy remesh.
+        del terr_v, terr_f, bld_v, bld_f, pieces
+        import gc
+        gc.collect()
+
+        # Fuse to PLY (welded/indexed) not STL (per-triangle soup). The voxel-remesh
+        # output is perfectly watertight; STL un-welds it and re-welding in trimesh
+        # manufactures hundreds of SPURIOUS non-manifold edges. PLY carries Blender's
+        # clean welding straight through.
+        raw_ply = workdir / "fused.ply"
+        log(f"[blender] fusing (join + voxel remesh {voxel_size}m -> watertight PLY)...")
+        subprocess.run(
+            [str(BLENDER_PATH), "--background", "--python", str(_FUSE_SCRIPT), "--",
+             "--terrain", str(terr_ply), "--buildings", str(bld_ply), "--output", str(raw_ply),
+             "--voxel-size", str(voxel_size), "--skip-terrain-solidify",
+             "--skip-debris"],  # clip's keep-largest handles debris; skip the ~30s Blender split
+            check=True,
+        )
+        log(f"[blender] fuse done")
+        mesh = mr.loadMesh(str(raw_ply))
 
     # meshlib manifold-preserving decimation -- replaces fast_simplification +
     # pymeshfix ENTIRELY. meshlib's half-edge topology literally cannot represent
@@ -227,8 +278,6 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     # meshopt broke it -> 351 non-manifold + 613 holes -> forced a slow ~45s
     # pymeshfix global rebuild). Same face count, watertight, no repair needed.
     log(f"[decimate] meshlib manifold-preserving decimation (stays watertight, no pymeshfix)...")
-    import meshlib.mrmeshpy as mr
-    mesh = mr.loadMesh(str(raw_ply))
     nf0 = mesh.topology.numValidFaces()
     ds = mr.DecimateSettings()
     ds.maxDeletedFaces = int(nf0 * target_reduction)
@@ -244,7 +293,19 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     # cut; drops the terrain margin and any floating remesh debris in one step.
     log(f"[clip] meshlib boolean intersect with exact domain polygon...")
     bb = mesh.computeBoundingBox()
-    clip_solid = _polygon_clip_solid(domain_polygon, bb.min.z - 10.0, bb.max.z + 10.0)
+    # Nudge the clip polygon OFF the voxel grid before cutting. The remesh puts
+    # vertices on a voxel_size grid and domain bounds are round numbers, so the cut
+    # plane lands exactly on grid-aligned vertices and the retriangulation emits
+    # collinear zero-area slivers there -- measured as bad edges of exactly 8.00 m
+    # and 16.00 m (4 and 8 voxels) on the clip walls. Same coincident-surface class
+    # the include_base=False terrain subtraction already dodges with a scale nudge.
+    # 1 mm is ~3 orders below the CFD cell and below STL's own float32 resolution
+    # at SVY21 coords, so the domain is unchanged for any practical purpose.
+    _nudge = float(os.environ.get("SBG_CLIP_NUDGE_M", "0.001"))
+    _clip_poly = domain_polygon.buffer(-_nudge) if _nudge else domain_polygon
+    if _clip_poly.is_empty or _clip_poly.geom_type != "Polygon":
+        _clip_poly = domain_polygon
+    clip_solid = _polygon_clip_solid(_clip_poly, bb.min.z - 10.0, bb.max.z + 10.0)
     res = mr.boolean(mesh, clip_solid, mr.BooleanOperation.Intersection)
     if not res.valid():
         raise RuntimeError("meshlib boolean clip failed (invalid result)")
@@ -424,7 +485,15 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     for _pass in range(4):
         _v = _mn.getNumpyVerts(polished)
         _f = _mn.getNumpyFaces(polished.topology)
-        _tri = _v[_f]
+        # Test degeneracy at the precision the SHIPPED FORMAT stores, not float64.
+        # STL is float32; at SVY21 coords (~30,000 m) that is ~2 mm spacing, so a
+        # 40 m x 2 mm collinear sliver has area 0.04 m^2 in memory -- 1e8 times above
+        # any sane threshold -- and collapses to EXACTLY zero only once written.
+        # Measured with fuse_backend="meshlib" on Kent Ridge: two such slivers on the
+        # ymax clip wall (4 edges, 80 m perimeter, all four vertices at y=31150 AND
+        # z=8.0, i.e. collinear) passed this test in float64, were written, and
+        # reopened as 2 holes on reload. Rounding to float32 first catches them.
+        _tri = _v[_f].astype(np.float32).astype(np.float64)
         _area = 0.5 * np.linalg.norm(
             np.cross(_tri[:, 1] - _tri[:, 0], _tri[:, 2] - _tri[:, 0]), axis=1)
         _bad = _area < 1e-9
@@ -433,6 +502,20 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
         _dropped += int(_bad.sum())
         polished = _mn.meshFromFacesVerts(
             np.asarray(_f[~_bad], dtype=np.int32), np.asarray(_v, dtype=np.float64))
+        # STITCH BEFORE FILLING. Dropping a collinear sliver on the clip wall can
+        # leave a DEGENERATE FLAP -- a boundary that runs out along a line and back
+        # along the same line, pinching at a repeated vertex, enclosing zero area.
+        # Measured on Kent Ridge (fuse_backend="meshlib"): loop
+        # (22090,31150,8) -> (22106) -> (22090) -> (22066) -> back, v0 == v2 exactly.
+        # fillHole on such a loop emits MORE zero-area triangles, which the next
+        # pass drops, which reopens it -- an oscillation that hits the pass cap and
+        # ships a mesh that is closed in memory only by degenerate faces, so an STL
+        # reload (which discards them) reopens the hole. Uniting the coincident
+        # boundary vertices closes the flap properly, adding no geometry.
+        try:
+            mr.uniteCloseVertices(polished, 1e-6, True)
+        except Exception:
+            pass
         for _ in range(4):
             edges = polished.topology.findHoleRepresentiveEdges()
             if not len(edges):
@@ -450,6 +533,21 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     # Rewrite unconditionally: the file on disk is the pre-polish `clipped` save,
     # so skipping this when n0 == 0 would ship the unpolished, hole-filled-less mesh.
     mr.saveMesh(polished, str(out_stl))
+
+    # Report closure IN THE SHIPPED FORMAT, not just in memory. STL stores float32
+    # per-triangle soup, so a re-weld can OPEN holes that were absent in memory --
+    # measured on Kent Ridge with fuse_backend="meshlib": every in-memory stage
+    # logged holes=0 and the written STL reloads with 2. (Same class as the
+    # manifold/README warning that STL loses topology; here it costs closure.)
+    # This is a CHECK, not a repair: iterating fillHole on the reloaded mesh was
+    # tried and oscillates (2 -> 1 -> 1 -> 2) while introducing a multi-edge, so
+    # it is deliberately not attempted. See the fuse_backend note.
+    _shipped = len(mr.loadMesh(str(out_stl)).topology.findHoleRepresentiveEdges())
+    if _shipped:
+        log(f"[verify] WARNING: the written STL reloads with {_shipped} hole(s) "
+            f"(in-memory holes=0). Not strictly watertight as shipped.")
+    else:
+        log(f"[verify] shipped STL reloads closed (holes=0)")
 
     # include_base=False: strip the ground/terrain plane from the EXPORTED file
     # only -- terrain stayed in the Blender join/voxel-remesh above the whole
@@ -521,6 +619,17 @@ def main():
                     help="precomputed placed-building store (see sbg.onemap_native.precompute); "
                          "when set, cutout loads from it instead of fetching/decoding tiles")
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--fuse-backend", choices=("meshlib", "blender"), default="meshlib",
+                    help="voxel-remesh backend. Both call OpenVDB; the FUSE STEP is "
+                         "equivalent (1,300,768 faces either way, volume differing by 1 m3 "
+                         "in 37.4M) and meshlib is 4.25x faster (0.8s vs 3.4s) with no "
+                         "Blender install. BUT end-to-end they are NOT identical: on Kent "
+                         "Both call OpenVDB and are equivalent end-to-end: measured on 3 real "
+                         "domains, both give holes=0 / 0 open / 0 non-manifold / 0 zero-area / "
+                         "strictly watertight / 1 body, with volume agreeing to 0.001-0.004%. "
+                         "meshlib is 4.25x faster on the fuse (0.8s vs 3.4s) and needs no Blender "
+                         "install, so it is the default; 'blender' is an escape hatch requiring "
+                         "SBG_BLENDER_PATH.")
     ap.add_argument("--placement", choices=("group", "drape", "laplacian"),
                     default="drape",
                     help="how connected buildings spanning relief are levelled: "
@@ -546,6 +655,7 @@ def main():
     build_domain_stl(domain, args.output, step=args.step, voxel_size=args.voxel_size,
                      target_reduction=args.target_reduction, decimate_error=args.decimate_error,
                      workers=args.workers, store_dir=args.store, workdir=args.workdir,
+                     fuse_backend=args.fuse_backend,
                      include_base=not args.no_base, placement=args.placement,
                      coupling_lambda=args.coupling_lambda)
 

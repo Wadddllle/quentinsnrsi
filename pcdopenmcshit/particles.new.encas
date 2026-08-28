@@ -1,0 +1,14 @@
+FORMAT
+type:  ensight gold
+GEOMETRY
+model: particles.geo
+measured: particles.mpg0001
+VARIABLE
+vector per node: Velocity                                         particles.vel
+TIME
+time set: 1 Model
+number of steps: 10
+filename start number:     1
+filename increment:        1
+time values:   0.00000e+00  1.60184e+04  3.20369e+04  4.80553e+04  6.40737e+04  8.00922e+04  9.61106e+04  1.12129e+05 
+ 1.28147e+05  1.44166e+05 

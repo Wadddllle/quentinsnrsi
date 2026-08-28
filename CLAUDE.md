@@ -2,11 +2,50 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Start with [`README.md`](README.md)** — it documents the current (v2) pipeline, the two
+> output paths, the intended CFD workflow, and how to run/containerize it. This file is the
+> working-notes companion: build commands, verification habits, and the v1 architecture.
+>
+> **v2 (`sbg/onemap_native/`) is the current pipeline** and the one to touch for STL work.
+> The v1 CityJSON stack described below still works and is what you want for per-building
+> semantics, but it is not the STL path any more. Container files: `Dockerfile`,
+> `docker-compose.yml`, `.dockerignore`; deps are `requirements-v2.txt` (v2, pinned, what
+> the image installs) and `requirements-sbg.txt` (everything, incl. v1).
+
 ## What this is
 
 SBG (Singapore Building Geometry): a pipeline that builds a Singapore-wide CityJSON building dataset from OSM footprints + SLA OneMap 3D data, overlays terrain, cuts out CFD-domain-sized subsets, and exports watertight STLs via Blender for radionuclide plume-dispersion CFD meshing. `sbg/` is the Python pipeline/library; `sbg/ui/` + `webui/` is a local-first FastAPI+Vue3 web app wrapping it (run via `python -m sbg.ui`, opens a browser tab — no hosting, single local instance per user).
 
 Full design history, every architecture decision and why, and every non-obvious bug found (with root causes) live in `/home/quentin/.claude/plans/we-are-in-deep-imperative-petal.md` — read it before assuming something is unexplored or before re-deriving an approach that was already tried and rejected.
+
+> **v2 no longer needs Blender.** `build_domain_stl(fuse_backend=...)` defaults to
+> `"meshlib"` — Blender's `REMESH(VOXEL)` and meshlib's `offsetMesh(offset=0)` both call
+> OpenVDB, and they are equivalent end-to-end on three real domains (holes/open/
+> non-manifold/zero-area all 0, strictly watertight, volume agreeing to 0.001–0.004%),
+> with meshlib 4.25× faster on the fuse. `--fuse-backend blender` is an escape hatch and
+> is the only thing that still needs `SBG_BLENDER_PATH`. **v1 (`sbg/blender/`) still
+> requires Blender.** Related: the boolean clip now nudges the domain polygon in by
+> `SBG_CLIP_NUDGE_M` (1 mm) so it never cuts through voxel-grid vertices — that fixed a
+> latent zero-area-sliver bug present in *both* backends.
+>
+> **The mesh-quality workstream is CLOSED (2026-08-27). Do not reopen it unprompted.**
+> The CFD path was never blocked: snappyHexMesh meshed the raw export (1,030,259 cells,
+> no errors) and Ansys fault-tolerant meshing already uses it. The long "watertight,
+> 0 non-manifold, 0 self-intersection" chase was for the Ansys *watertight* workflow,
+> which is one option of three and not the one in use. The one load-bearing fix is
+> `seal_piece` (in `sbg/onemap_native/extract.py`) — OneMap meshes are un-welded
+> double-sided soup, which no isosurface extractor can sign; sealing is why buildings
+> stop disintegrating. Solved-but-deliberately-unwired work (per-building fTetWild +
+> `pymeshfix` at 287/287 clean, manifold3d union, dilate→union) and the exit path if it
+> ever reopens are in `sbg/onemap_native/research_2/PROBLEM_BRIEF.md` §13–§14.
+> **Active work is the dose/CFD side** — see `dose/NOTES.md`.
+
+`dose/` is the radionuclide dose workstream: Fluent particle tracks → OpenMC/DAGMC photon
+transport → cloudshine and groundshine maps. `dose/NOTES.md` is its run log, settled
+decisions, and deferred features; `dose/PARTICLES_XML_FORMAT.md` documents the CFD-Post
+`<ParticleTracks>` format. Nuclear data lives at `/home/quentin/nuclear_data`; the
+MOAB/DAGMC toolchain is a separate conda env (`~/tools/mamba/root/envs/{dagmc,moabpy}`),
+**not** the project `.venv`.
 
 ## Setup and commands
 

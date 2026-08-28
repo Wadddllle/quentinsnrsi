@@ -1,22 +1,41 @@
+# Full dev/legacy set: everything sbg/ can import, including the v1 CityJSON
+# pipeline and the v1 web UI. For the v2 tile-native pipeline + UI (what ships
+# in the container) use the smaller, pinned requirements-v2.txt instead.
+
+# --- core geometry / CRS (v1 + v2) ---
 shapely
 pyproj
 numpy
 scipy
 rasterio
-cjio
-ijson
-matplotlib
-folium
 trimesh
 triangle
+mapbox-earcut          # earcut: skirt/base caps in onemap_native/terrain.py
+
+# --- OneMap 3D-Tiles decode (v1 + v2) ---
 DracoPy
 pygltflib
-pymeshfix
+requests
+
+# --- mesh repair / simplify ---
+meshlib                # decimate + boolean + hole/degeneracy repair (v2, primary)
+pymeshfix              # v1 STL repair only (sbg/blender/repair_stl.py)
+fast-simplification    # v1 STL decimate only (sbg/blender/repair_stl.py)
+
+# --- web app (v1 + v2) ---
 fastapi
 uvicorn
 orjson
-fast-simplification
 python-multipart
-rtree
-meshlib
-opencv-python  # cv2: fast scan-line pad rasterization in onemap_native/terrain.py (optional -- matplotlib fallback)
+
+# --- v1 CityJSON pipeline only ---
+cjio                   # `cjio export obj` subprocess in sbg/ui/pipeline.py
+ijson                  # streaming parse of the 634MB NationalMapLine.geojson
+
+# --- optional / diagnostics ---
+opencv-python-headless # cv2.fillPoly pad rasterization (terrain.py; matplotlib fallback)
+matplotlib             # cv2 fallback + sbg/diagnostics.py
+folium                 # sbg/diagnostics.py map export
+
+# Research-only (sbg/onemap_native/research/), NOT needed to run the pipeline:
+#   open3d, pandas
