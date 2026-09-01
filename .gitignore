@@ -39,6 +39,9 @@ doc/*.fls
 doc/*.log
 doc/*.pdf
 
+/papers/
+/pcdopenmcshit/
+
 # --- Large / generated datasets (raw downloads, backups, pipeline outputs) ---
 /data/
 /hdb.json
