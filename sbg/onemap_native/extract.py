@@ -125,7 +125,7 @@ def _footprint_rings(base_pts_xy, cluster_dist=_FOOTPRINT_CLUSTER_M):
     return [r.astype(np.float32) for r in rings]
 
 
-def _extract_tile(uri, domain_polygon, archive):
+def _extract_tile(uri, domain_polygon, archive, require_full=True):
     """Decode one leaf tile -> list of per-_BATCHID building-piece dicts. If
     domain_polygon is given, keep only pieces whose centroid falls inside it
     (domain_polygon=None keeps every piece -- used by the whole-island
@@ -169,16 +169,24 @@ def _extract_tile(uri, domain_polygon, archive):
                 v = svy[used]
                 if np.ptp(v[:, 2]) < FLAT_PLATE_Z:
                     continue  # ground plate, not real volume
-                # Keep only buildings FULLY inside the domain (every vertex in), not
-                # just centroid-inside. A building whose centroid is inside but whose
-                # body pokes past the boundary would otherwise be SLICED flat by the
-                # meshlib box clip downstream -- the "every building sliced, half in
-                # half out" bug. Dropping crossing buildings instead is Deliverable
-                # 3's semantics ("remove buildings cut through by the domain
-                # boundary") and matches /api/domain/preview's "kept" (query_contained).
-                if domain_polygon is not None and not np.all(
-                        contains_xy(domain_polygon, v[:, 0], v[:, 1])):
-                    continue
+                # `require_full` decides what happens to a building straddling the
+                # boundary, and the right answer depends on whether this polygon is
+                # also the CLIP line.
+                #
+                #   True  (no buffer): the ROI *is* where the mesh gets cut, so a
+                #         straddler would be SLICED flat by the meshlib box clip --
+                #         the "every building half in, half out" bug. Dropping it is
+                #         Deliverable 3's semantics and matches /api/domain/preview's
+                #         "kept" (query_contained).
+                #   False (buffer on): the clip is 250-750 m away at the wind
+                #         rectangle, so nothing slices a straddler. Dropping it would
+                #         instead leave a one-building-deep ring of bare ground around
+                #         the ROI -- exactly where the urban roughness transition and
+                #         the near-boundary shielding matter most.
+                if domain_polygon is not None:
+                    inside = contains_xy(domain_polygon, v[:, 0], v[:, 1])
+                    if not (np.all(inside) if require_full else np.any(inside)):
+                        continue
                 remap = np.zeros(len(svy), dtype=np.int64)
                 remap[used] = np.arange(len(used))
                 base_z = float(v[:, 2].min())
@@ -195,7 +203,8 @@ def _extract_tile(uri, domain_polygon, archive):
     return out
 
 
-def pieces_from_store(store_dir, tile_uri, domain_polygon=None):
+def pieces_from_store(store_dir, tile_uri, domain_polygon=None,
+                      require_full=True):
     """Load precomputed building pieces for one tile from the store, filtering
     to domain_polygon by centroid if given. Returns [] if the tile isn't in the
     store (caller can fall back to a live decode)."""
@@ -210,13 +219,15 @@ def pieces_from_store(store_dir, tile_uri, domain_polygon=None):
     out = []
     for pc in pieces:
         v = pc["verts"]
-        if np.all(contains_xy(domain_polygon, v[:, 0], v[:, 1])):  # fully inside, not just centroid
+        inside = contains_xy(domain_polygon, v[:, 0], v[:, 1])
+        if np.all(inside) if require_full else np.any(inside):   # see _extract_tile
             out.append(pc)
     return out
 
 
 def extract_domain_buildings(leaf_uris, domain_polygon, archive=None,
-                             workers=DEFAULT_WORKERS, progress=None, store_dir=None):
+                             workers=DEFAULT_WORKERS, progress=None, store_dir=None,
+                             require_full=True):
     """Extract every building piece whose centroid falls in domain_polygon.
 
     If store_dir is given, pieces are loaded from the precomputed store (fast
@@ -235,7 +246,7 @@ def extract_domain_buildings(leaf_uris, domain_polygon, archive=None,
     if store_dir is not None:
         pieces, misses = [], []
         for i, u in enumerate(leaf_uris, 1):
-            got = pieces_from_store(store_dir, u, domain_polygon)
+            got = pieces_from_store(store_dir, u, domain_polygon, require_full)
             if got:
                 pieces.extend(got)
             elif not (_store_has_tile(store_dir, u)):
@@ -244,14 +255,14 @@ def extract_domain_buildings(leaf_uris, domain_polygon, archive=None,
                 progress(i, total)
         if misses:
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_extract_tile, u, domain_polygon, archive): u for u in misses}
+                futs = {ex.submit(_extract_tile, u, domain_polygon, archive, require_full): u for u in misses}
                 for fut in as_completed(futs):
                     pieces.extend(fut.result())
         return pieces
 
     pieces = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_extract_tile, u, domain_polygon, archive): u for u in leaf_uris}
+        futs = {ex.submit(_extract_tile, u, domain_polygon, archive, require_full): u for u in leaf_uris}
         for i, fut in enumerate(as_completed(futs), 1):
             pieces.extend(fut.result())
             if progress is not None:

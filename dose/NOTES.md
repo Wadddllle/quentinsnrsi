@@ -384,9 +384,22 @@ More DRW tries is the fix if the deposition footprint itself is ever the deliver
 
 ---
 
-## Deferred feature: CFD buffer domain
+## CFD buffer domain — SHIPPED, except the edge flattening (2026-08-28)
 
-**Status: idea only, user to clarify scope.** Raised because urban-CFD guidance wants
+**Status: built as part of the wind work.** The buffer is sized 5H/15H/5H from COST 732,
+H comes from the tallest actually-extracted building, and the buffer holds **terrain only,
+no buildings** — with the urban roughness `z0` carried in the sidecar as an advisory wall
+BC rather than baked into the mesh (design option 3 below, as recommended). Measured cost:
+an 8.78 km² envelope, 10.8× its ROI, builds in **36.8 s at 2.76 GB peak** — because buffer
+terrain adds triangles with area while buildings do not, and buildings exist only in the ROI.
+
+**Not shipped: item 4, the cliff problem.** v1 ships real terrain right up to the wall and
+records each wall's terrain z-range in the sidecar, so the user can judge whether the slope
+matters for their inlet. Flattening the outer ring is a CDT constraint-ring change, not the
+`flatten_pads` apron suggested below — that apron is the legacy raster path and its own
+docstring records it as net-harmful on slopes.
+
+Original reasoning, kept as written. Raised because urban-CFD guidance wants
 ≥5H upstream, ≥15H downstream and ≥5H lateral of the region of interest, and our domain
 walls currently *are* the ROI walls. With H ≈ 50 m that is ~250 m / ~750 m.
 
@@ -426,9 +439,18 @@ polygons, so the clip needs no change.
 
 ---
 
-## Deferred feature: wind direction as a build input
+## Wind direction as a build input — SHIPPED (2026-08-28)
 
-**Status: idea only, user to clarify scope.** Motivated by a real workflow limitation: the
+**Status: built and verified, CLI + web UI.** `sbg/onemap_native/wind.py` is the single
+source of truth for the convention; `build.py` emits one already-rotated STL per bearing
+plus a `<stem>.wind.json` sidecar. Verified: georeference round trip 0.00e+00 m on every
+direction, 8/8 strictly watertight, ROI content invariant to 0.000% across directions, and
+the builder's transform agrees with `read_particle_tracks.to_world` to 0.00e+00 m.
+
+The dose-side consequences are in "Dose with a buffer domain" below. The original design
+note is kept as written, because the reasoning is still the reasoning.
+
+Motivated by a real workflow limitation: the
 domain box is axis-aligned in EPSG:3414, and Fluent's `Magnitude, Normal to Boundary` inlet
 blows perpendicular to a face — so only the four grid-aligned directions are reachable
 (xmin↔xmax, ymin↔ymax). A 45° wind currently means rotating the mesh by hand, which is
@@ -477,6 +499,110 @@ these two together rather than separately.
 
 ---
 
+## Dose with a buffer domain: source over everything, tally over the ROI
+
+Now that the domain is ROI + bare-terrain buffer, the obvious instinct is to restrict the
+dose calculation to particles inside the ROI. **That is right for the tally and wrong for
+the source**, and the split is nearly free in both directions.
+
+### Source: use the whole domain, buffer included
+
+The photon mfp in air at 662 keV is **106.5 m**. For a receptor in a cloud the geometric
+1/r² cancels against shell area, so contribution per unit *distance* is just
+`C(r)·exp(−r/λ)` — which is why the semi-infinite-cloud integral converges only after a few
+mfp. Truncating the source at range R captures `1 − exp(−R/λ)`:
+
+| R | 100 m | 200 m | 400 m | 750 m |
+|---|---|---|---|---|
+| fraction of the line integral | 61% | 85% | 98% | 99.9% |
+
+So clipping the source to the ROI truncates each receptor's integral at its own
+distance-to-edge, and an ROI-edge receptor loses most of one hemisphere.
+
+**This is already a live artefact, not a hypothetical.** In run 3 the peak sits 230 m
+downwind with only 170 m of domain past it, so part of the observed downwind falloff is the
+boundary, not the plume. The 15H buffer (750 m at H = 50 m) closes it to 99.9%. The same
+argument is why the release must move inboard of the inlet plane: gamma reaches ~120 m
+upwind at 1 MeV, so upwind receptors take real dose that a zero-fetch domain cannot produce.
+
+Cost of the bigger source: essentially nil. A 1400×900 domain at a 10 m bin is ~290k source
+cells against today's 36.8k, mostly zero-strength (the plume is a ribbon), and OpenMC's
+runtime scales with **particles simulated**, not source cells. Rejection sampling gets
+*cheaper* too — the buffer has no buildings, so fewer births land in concrete.
+
+### Tally: restrict to the ROI, and this one is load-bearing for the statistics
+
+Tallying the full buffered domain instead of the ROI is 7.9× the cells (1.26 km² vs
+0.16 km²), hence 7.9× fewer counts each and **√7.9 = 2.8× worse relative error** — the
+current 6.8% dose-weighted would degrade to ~19%. Restricting the tally to the ROI keeps
+today's statistics exactly, and nobody wants a dose map over bare buffer terrain anyway.
+
+Both extents are already in the sidecar: `domain_rotated` for the source,
+`core_roi.rotated_bounds` for the tally. `run_dose.py` currently uses `domain_rotated` for
+both.
+
+### Groundshine inverts, and lands in the same place
+
+Deposition is local, so buffer deposit contributes little to an ROI receptor. But buffer
+columns are also mostly *empty* — no buildings to force touchdown, so the plume stays
+elevated — which makes including them self-limiting rather than expensive. Same split.
+
+### The decision worth making now, not later: where the receptor grid lives
+
+A wind rose is 8–16 directions, each built and transported in **its own rotated frame**, but
+sharing one ROI in world coordinates (that is what `core_polygon` guarantees). Combining
+them into a frequency-weighted annual map therefore needs every direction on a common world
+grid — and `openmc.RegularMesh` is axis-aligned, so the tally grid is axis-aligned in the
+*rotated* frame and un-rotates to a tilted point cloud in world space.
+
+Two ways out:
+
+- **Resample each direction's CSV onto a common world grid.** Simple, but it is N scattered
+  interpolations. Tolerable for the flat cloudshine field; it visibly smooths the sharp
+  groundshine ribbon, which is the one map whose structure is the deliverable.
+- **Define the receptor grid in WORLD coordinates once, rotate those points into each
+  direction's frame, and sample the tally there.** No interpolation across directions at
+  all — every direction reports at the same physical points, so combining is a plain
+  weighted sum. This is the same operation `read_dose.py` already performs in z (bin-centre
+  lerp), just extended to x and y.
+
+The second is right and is cheap *now*; retrofitting it after N runs exist is not. It also
+happens to be exactly the change that fixes the frame bug below, since a world-frame
+receptor grid is what the DTM wants sampled anyway.
+
+### Two frame bugs, live as of 2026-08-28
+
+The wind work threaded the rotated frame through `run_dose.py` and
+`read_particle_tracks.py` and stopped there. Both remaining DTM consumers are stale:
+
+- `read_dose.py:71` samples the **world-frame** `data/dtm.tif` at **rotated-frame** X/Y,
+  then writes the CSV header `x_svy21,y_svy21` and labels the plot "EPSG:3414 easting".
+- `run_groundshine.py:135` does the same for the deposition grade lookup.
+
+On **every** bearing except 180° each column got the elevation of the wrong place. The
+obvious guess — "only diagonal bearings" — is wrong, and worth stating precisely:
+`psi = (wind_from + 180) % 360`, so `wind_from = 0` (from the north, flowing south) is a
+**180° rotation**, which displaces every point by twice its distance from the centre. Only
+`wind_from = 180` is a no-op. Measured on a real 2.76 km² envelope at wind_from 0 and 45:
+displacement up to **2,370 m**, mean ground error **8.8–12.2 m**, max **40 m** — the entire
+terrain range of the domain.
+
+This was the exact silently-mis-georeferenced failure this file warns about, and it sat in
+the reader rather than in the physics, so it would never have shown up as a wrong-looking
+number — only as a wrong-looking map.
+
+**FIXED (2026-08-31).** The fix needed **both frames at once**: rotated for tally indexing
+and `mesh.contains()` (the STL is rotated), world for the DTM sample and the CSV/plot.
+`read_dose.py` reads the rotation straight out of `run_meta.json` (`run_dose.py` was
+already copying it there), so nothing new is loaded; `run_groundshine.py` gained a `--wind`
+argument. `dose_map.csv` now carries **both** frames — `x_rot,y_rot` (the regular grid the
+plotters reshape on) and `x_svy21,y_svy21` (true world) — because un-rotating the grid
+leaves a tilted point cloud that `np.unique` cannot grid. `plot_dose.py` and
+`compare_dose.py` were updated to key off the rotated columns, with a fallback to the old
+5-column schema.
+
+---
+
 ## Mesh workstream closed (2026-08-27) — what it means for this pipeline
 
 Recorded here because it decides what geometry the dose work is built on.
@@ -508,5 +634,7 @@ but is deliberately not wired in.
 Irrelevant at 3 m CFD cells and for photon transport, but do coincident-surface work in
 a domain-local frame.
 
-**Next up:** the two deferred features above — CFD buffer domain and wind direction as a
-build input.
+**Next up:** both features above are shipped on the geometry side. What is left is the dose
+side of them — see "Dose with a buffer domain": the source/tally extent split, a world-frame
+receptor grid so a wind rose can be combined without resampling, and the two frame bugs in
+`read_dose.py` / `run_groundshine.py`.

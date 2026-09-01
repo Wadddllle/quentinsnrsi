@@ -28,10 +28,14 @@ EnergyFunctionFilter multiplies by the ICRP-116 coefficient in pSv cm^2:
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import openmc
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from read_particle_tracks import to_world
 
 
 def main():
@@ -64,18 +68,45 @@ def main():
     ys = lo[1] + (np.arange(ny) + 0.5) * (hi[1] - lo[1]) / ny
     X, Y = np.meshgrid(xs, ys, indexing="ij")
 
+    # THE ONE PLACE TWO FRAMES MEET.
+    #
+    # X/Y are tally-cell centres, so they are in whatever frame the tally mesh was built
+    # in -- and for a wind-aligned domain that is the ROTATED frame (the STL was exported
+    # already rotated, so the .h5m, the Fluent case and the tracks all live there too).
+    # `data/dtm.tif` is the exception: it is a static island-wide raster in TRUE EPSG:3414
+    # that nothing rotates and nothing could, since it is shared across every domain and
+    # every bearing.
+    #
+    # Sampling a world raster at rotated coordinates asks for the elevation of a different
+    # physical place -- correct only at the rotation centre, and off by ~383 m at 500 m out
+    # on a 45 deg bearing, which on 20-60 m terrain is enough to pick the wrong z bin
+    # outright. So: un-rotate for the DTM, keep the rotated ones for everything that
+    # touches the STL.
+    #
+    # `run_dose.py` already copied the rotation into run_meta.json, so nothing new is
+    # loaded here. `to_world` returns its input unchanged when W is None, so a non-wind
+    # run is bit-for-bit unaffected.
+    W = meta.get("wind")
+    world = to_world(np.column_stack([X.ravel(), Y.ravel(), np.zeros(X.size)]), W)
+    XW, YW = world[:, 0].reshape(nx, ny), world[:, 1].reshape(nx, ny)
+    if W:
+        print(f"\nframe: rotated (wind from {W['wind_from_deg']:g} deg); "
+              f"DTM sampled in true EPSG:3414")
+
     # local grade from the DTM (independent of the fused STL, which cannot tell a
     # rooftop from the ground by ray casting alone)
     import rasterio
     with rasterio.open(a.dtm) as r:
-        ground = np.array([v[0] for v in r.sample(np.column_stack([X.ravel(), Y.ravel()]))],
+        ground = np.array([v[0] for v in r.sample(np.column_stack([XW.ravel(), YW.ravel()]))],
                           dtype=float).reshape(nx, ny)
 
     zr = ground + rh
     zbin = ((zr - zlo) / (zhi - zlo) * nz).astype(int)
     valid = (zbin >= 0) & (zbin < nz)
 
-    # mask receptors that land inside a building
+    # mask receptors that land inside a building. NOTE the ROTATED X/Y here, not the
+    # un-rotated XW/YW used for the DTM above: the STL is exported already rotated, so a
+    # containment test against it must be done in that same frame.
     import trimesh
     m = trimesh.load(meta["stl"], process=False)
     m.merge_vertices()
@@ -117,13 +148,22 @@ def main():
     print(f"  rel. error at peak: {rel.ravel()[np.nanargmax(dose)]:.1%}")
     w = dose[live]
     print(f"  rel. error, dose-weighted: {(rel[live]*w).sum()/w.sum():.1%}")
-    iy, ix = np.unravel_index(np.nanargmax(dose), dose.shape)
-    print(f"  peak at EPSG:3414 ({xs[iy]:.1f}, {ys[ix]:.1f}), grade {ground[iy,ix]:.1f} m")
+    # dose.shape is (nx, ny), so unravel_index yields (x index, y index) in that order.
+    kx, ky = np.unravel_index(np.nanargmax(dose), dose.shape)
+    print(f"  peak at EPSG:3414 ({XW[kx,ky]:.1f}, {YW[kx,ky]:.1f}), "
+          f"grade {ground[kx,ky]:.1f} m")
+    if W:
+        print(f"    (rotated frame: {X[kx,ky]:.1f}, {Y[kx,ky]:.1f})")
 
+    # BOTH frames are written. x_rot/y_rot is the regular axis-aligned grid the plotters
+    # reshape on (un-rotating it would leave a tilted point cloud that np.unique cannot
+    # grid); x_svy21/y_svy21 is the true-world position for georeferencing. With no wind
+    # the two pairs are identical.
     np.savetxt(d / a.csv,
-               np.column_stack([X.ravel(), Y.ravel(), ground.ravel(),
-                                dose.ravel(), rel.ravel()]),
-               delimiter=",", header="x_svy21,y_svy21,ground_m,uSv_per_h,rel_err",
+               np.column_stack([X.ravel(), Y.ravel(), XW.ravel(), YW.ravel(),
+                                ground.ravel(), dose.ravel(), rel.ravel()]),
+               delimiter=",",
+               header="x_rot,y_rot,x_svy21,y_svy21,ground_m,uSv_per_h,rel_err",
                comments="", fmt="%.6g")
     print(f"\nwrote {d/a.csv}")
 
@@ -140,10 +180,15 @@ def main():
                        norm=LogNorm(vmin=max(pos.min(), pos.max() / 1e3), vmax=pos.max()),
                        cmap=cm)
         ax.contour(X, Y, ground, levels=8, colors="w", linewidths=0.4, alpha=0.35)
-        ax.set_xlabel("EPSG:3414 easting (m)")
-        ax.set_ylabel("EPSG:3414 northing (m)")
+        # The image is drawn on the tally grid, which for a wind run is the ROTATED frame
+        # -- so say so rather than mislabel it EPSG:3414. Un-rotating would tilt the grid
+        # and imshow cannot draw a rotated raster.
+        ax.set_xlabel("rotated easting (m)" if W else "EPSG:3414 easting (m)")
+        ax.set_ylabel("rotated northing (m)" if W else "EPSG:3414 northing (m)")
+        frame = (f"\nrotated frame: wind from {W['wind_from_deg']:g}°, flow → +Y"
+                 if W else "")
         ax.set_title(f"Cloudshine, {rh:.1f} m above grade\nQ={meta['release_bq']:.0g} Bq/s Cs-137"
-                     " (grey = inside a building)", fontsize=10)
+                     f" (grey = inside a building){frame}", fontsize=10)
         fig.colorbar(im, ax=ax, label="uSv/h")
         fig.tight_layout()
         fig.savefig(d / a.png, dpi=130)

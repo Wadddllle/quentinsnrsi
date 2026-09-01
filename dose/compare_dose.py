@@ -18,10 +18,20 @@ from pathlib import Path
 import numpy as np
 
 
+def grid_cols(d):
+    """The columns to RESHAPE on: always the rotated frame, which is the regular
+    axis-aligned grid the tally was built on. `x_svy21` is the same grid un-rotated,
+    i.e. a tilted point cloud with every value distinct -- np.unique cannot grid it.
+    Falls back to x_svy21 for CSVs written before the schema gained both frames."""
+    return ((d["x_rot"], d["y_rot"]) if "x_rot" in d.dtype.names
+            else (d["x_svy21"], d["y_svy21"]))
+
+
 def load(csv):
     d = np.genfromtxt(csv, delimiter=",", names=True)
-    xs, ys = np.unique(d["x_svy21"]), np.unique(d["y_svy21"])
-    o = np.lexsort((d["y_svy21"], d["x_svy21"]))
+    gx, gy = grid_cols(d)
+    xs, ys = np.unique(gx), np.unique(gy)
+    o = np.lexsort((gy, gx))
     shape = (len(xs), len(ys))
     return xs, ys, d["uSv_per_h"][o].reshape(shape), d["ground_m"][o].reshape(shape)
 

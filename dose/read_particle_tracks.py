@@ -83,6 +83,55 @@ def by_name(items, cols):
     return {items[i]["name"]: c for i, c in cols.items()}
 
 
+def load_wind(path):
+    """Load a `<stem>.wind.json` sidecar written by sbg.onemap_native.build, or None.
+
+    Pure stdlib+numpy on purpose: dose/ has to import in the pymoab/dagmc conda envs,
+    which have no shapely.
+    """
+    import json
+    from pathlib import Path
+    p = Path(path)
+    return json.loads(p.read_text()) if p.is_file() else None
+
+
+def to_world(xyz, W):
+    """Rotated (Fluent/CFD) frame -> true EPSG:3414. Returns xyz unchanged when W is None.
+
+    *** DO NOT CALL THIS BEFORE BINNING PARTICLES INTO A SOURCE MESH. ***
+
+    When a wind-aligned domain is used, the STL is exported already rotated, so the .h5m,
+    the Fluent case, the particle tracks and any OpenMC source/tally mesh ALL live in the
+    rotated frame. Un-rotating the tracks first would place the source where the geometry
+    is not, and every photon would start in a vacuum -- producing a plausible-looking
+    near-zero dose map, which is the worst kind of failure.
+
+    Apply this ONLY when emitting a georeferenced product (a dose map on a real basemap).
+    Everything upstream of that stays rotated -- and gains from it, since the domain is
+    exactly axis-aligned there, so a RegularMesh fits it with no wasted cells.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if W is None:
+        return xyz
+    c = np.asarray(W["rotation"]["centre_m"], dtype=np.float64)
+    inv = np.asarray(W["rotation"]["inverse_matrix"], dtype=np.float64)
+    out = xyz.copy()
+    out[:, :2] = (xyz[:, :2] - c) @ inv.T + c      # z is never touched
+    return out
+
+
+def to_rotated(xyz, W):
+    """True EPSG:3414 -> rotated frame. Inverse of to_world; used for round-trip checks."""
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if W is None:
+        return xyz
+    c = np.asarray(W["rotation"]["centre_m"], dtype=np.float64)
+    fwd = np.asarray(W["rotation"]["forward_matrix"], dtype=np.float64)
+    out = xyz.copy()
+    out[:, :2] = (xyz[:, :2] - c) @ fwd.T + c
+    return out
+
+
 def residence_time(pid, t):
     """Per-step residence time, aligned to the LEAVING point of each step.
 
@@ -98,6 +147,10 @@ def residence_time(pid, t):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path")
+    ap.add_argument("--wind", default=None,
+                    help="a <stem>.wind.json sidecar. ONLY affects the bbox printed below "
+                         "(shown in true EPSG:3414 instead of the rotated frame). It does "
+                         "NOT transform the returned tracks -- see to_world().")
     a = ap.parse_args()
 
     items = read_items(a.path)
@@ -116,8 +169,12 @@ def main():
     mask, dt = residence_time(pid, t)
     print(f"\n{len(pid):,} points, {len(uid):,} tracks")
     print(f"points/track  min {cnt.min()} p50 {int(np.median(cnt))} max {cnt.max()}")
-    print("bbox " + "  ".join(f"{k} {lo:.1f}..{hi:.1f}" for k, lo, hi
-                              in zip("XYZ", xyz.min(0), xyz.max(0))))
+    W = load_wind(a.wind) if a.wind else None
+    shown = to_world(xyz, W)
+    frame = (f"true EPSG:3414 (un-rotated from wind-from-{W['wind_from_deg']:g} frame)"
+             if W else "as stored (rotated frame if the domain was wind-aligned)")
+    print(f"bbox [{frame}] " + "  ".join(f"{k} {lo:.1f}..{hi:.1f}" for k, lo, hi
+                                         in zip("XYZ", shown.min(0), shown.max(0))))
     print(f"time 0..{t.max():.1f} s   total residence {dt.sum():.4g} particle-s")
 
 

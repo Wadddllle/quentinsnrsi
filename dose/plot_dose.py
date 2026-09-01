@@ -60,7 +60,11 @@ def main():
     from matplotlib.patches import Patch
 
     d = np.genfromtxt(a.csv, delimiter=",", names=True)
-    x, y = d["x_svy21"], d["y_svy21"]
+    # Reshape on the ROTATED grid -- it is the regular one. `x_svy21` is that same grid
+    # un-rotated (a tilted point cloud), which np.unique cannot grid. Older CSVs carry
+    # only x_svy21, and for a non-wind run the two are identical anyway.
+    rot = "x_rot" in d.dtype.names
+    x, y = (d["x_rot"], d["y_rot"]) if rot else (d["x_svy21"], d["y_svy21"])
     dose, err, ground = d["uSv_per_h"], d["rel_err"], d["ground_m"]
 
     xs, ys = np.unique(x), np.unique(y)
@@ -108,8 +112,12 @@ def main():
         cs = ax.contour(X, Y, G, levels=7, colors=[muted], linewidths=0.5, alpha=0.5)
         ax.clabel(cs, inline=True, fontsize=6, fmt="%.0f m", colors=[muted])
 
-    ax.set_xlabel("EPSG:3414 easting (m)", color=ink, fontsize=9)
-    ax.set_ylabel("EPSG:3414 northing (m)", color=ink, fontsize=9)
+    # A wind run's grid is the rotated frame, so only claim EPSG:3414 when it really is
+    # one. Detected by whether the two frames in the CSV actually differ.
+    rotated = rot and not np.allclose(d["x_rot"], d["x_svy21"])
+    axes_frame = "rotated (wind → +Y)" if rotated else "EPSG:3414"
+    ax.set_xlabel(f"{axes_frame} easting (m)", color=ink, fontsize=9)
+    ax.set_ylabel(f"{axes_frame} northing (m)", color=ink, fontsize=9)
     ax.tick_params(colors=muted, labelsize=8, length=3, width=0.6)
     for s in ax.spines.values():
         s.set_color(muted); s.set_linewidth(0.6)

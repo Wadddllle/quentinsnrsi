@@ -45,6 +45,14 @@ const props = defineProps({
 	// undefined otherwise -- a prop rather than a method call so the parent
 	// can reactively clear it (e.g. Escape/cancel) without needing a ref.
 	placeMeshRequest: { type: Object, default: null },
+	// Wind/CFD-buffer overlays: the buffered domain envelope, the per-direction
+	// wind rectangle, and the flow arrow. Every one of these rings is computed
+	// SERVER-SIDE (sbg/onemap_native/ui/wind_plan.py) and handed here as plain
+	// world-coordinate points -- this component does no trigonometry. Two
+	// implementations of the rotation convention would diverge, and the failure
+	// mode is a mis-georeferenced dose map that looks entirely plausible.
+	// Each entry: { points: [[x,y],...], color, closed?, width?, z? }
+	overlays: { type: Array, default: () => [] },
 });
 
 const emit = defineEmits(['click', 'view-changed', 'mesh-placement-confirmed', 'mesh-placement-cancelled']);
@@ -55,6 +63,7 @@ let vertexRanges = {}; // buildingId -> [startVertex, endVertexExclusive]
 let hasAutoFitted = false;
 let fullExtentBounds = null; // {xmin,ymin,xmax,ymax} of all loaded footprints, for resetView()
 let ringLine = null;
+let overlayLines = [];   // wind/buffer overlays -- see the `overlays` prop
 let boundaryOnly = false; // true while a drag gesture is in progress on controls -- avoids fighting MapControls' own render loop
 
 // Phase 4b Path 3 (mesh import placement) -- see placeMeshRequest prop
@@ -232,24 +241,51 @@ function lineResolution() {
 	return new THREE.Vector2(el.clientWidth, el.clientHeight);
 }
 
-function updateRingLine() {
-	if (ringLine) {
-		scene.remove(ringLine);
-		ringLine.geometry.dispose();
-		ringLine.material.dispose();
-		ringLine = null;
-	}
-	if (!props.ring || props.ring.length < 2) return;
-	const points = props.ring.map(([x, y]) => new THREE.Vector3(x, y, 1));
-	points.push(points[0]);
+// Shared "fat line" builder -- Line2/LineGeometry/LineMaterial, because plain
+// THREE.Line's `linewidth` is silently ignored on most WebGL drivers (a real bug
+// this project already hit: overlays rendered as invisible 1px traces).
+function makeLine(points, { color = 0xffd23f, width = 3, z = 1, closed = true } = {}) {
+	const pts = points.map(([x, y]) => [x, y, z]);
+	if (closed && pts.length > 2) pts.push(pts[0]);
 	const flat = [];
-	for (const p of points) flat.push(p.x, p.y, p.z);
+	for (const p of pts) flat.push(p[0], p[1], p[2]);
 	const geometry = new LineGeometry();
 	geometry.setPositions(flat);
-	const material = new LineMaterial({ color: 0xffd23f, linewidth: 3, resolution: lineResolution() });
-	ringLine = new Line2(geometry, material);
-	ringLine.computeLineDistances();
+	const material = new LineMaterial({ color, linewidth: width, resolution: lineResolution() });
+	const line = new Line2(geometry, material);
+	line.computeLineDistances();
+	return line;
+}
+
+function disposeLine(line) {
+	if (!line) return;
+	scene.remove(line);
+	line.geometry.dispose();
+	line.material.dispose();
+}
+
+function updateRingLine() {
+	disposeLine(ringLine);
+	ringLine = null;
+	if (!props.ring || props.ring.length < 2) return;
+	ringLine = makeLine(props.ring, { color: 0xffd23f, width: 3, z: 1 });
 	scene.add(ringLine);
+}
+
+function updateOverlays() {
+	for (const l of overlayLines) disposeLine(l);
+	overlayLines = [];
+	for (const o of props.overlays || []) {
+		if (!o || !o.points || o.points.length < 2) continue;
+		// z below the ROI ring (1) so the drawn area of interest always stays
+		// readable on top of the larger buffered domain around it.
+		const line = makeLine(o.points, {
+			color: o.color ?? 0x6f8fbf, width: o.width ?? 2,
+			z: o.z ?? 0.5, closed: o.closed !== false,
+		});
+		overlayLines.push(line);
+		scene.add(line);
+	}
 }
 
 function render() {
@@ -537,6 +573,7 @@ watch(() => props.placeMeshRequest, (newVal) => {
 watch(() => props.footprints, rebuildGeometry);
 watch(() => [props.keptIds, props.crossingIds, props.removedIds], () => { applySelectionColors(); render(); }, { deep: true });
 watch(() => props.ring, () => { updateRingLine(); render(); }, { deep: true });
+watch(() => props.overlays, () => { updateOverlays(); render(); }, { deep: true });
 
 function onResize() {
 	const el = containerRef.value;
@@ -547,7 +584,10 @@ function onResize() {
 	camera.top = frustumH / 2;
 	camera.bottom = -frustumH / 2;
 	camera.updateProjectionMatrix();
+	// LineMaterial needs the pixel resolution to size a screen-space-width line;
+	// miss one of these and that overlay silently renders at the wrong thickness.
 	if (ringLine) ringLine.material.resolution.copy(lineResolution());
+	for (const l of overlayLines) l.material.resolution.copy(lineResolution());
 	render();
 }
 
@@ -580,6 +620,7 @@ onMounted(() => {
 		console.warn('[OrthoWebGLView] WebGL context restored -- rebuilding geometry and re-rendering.');
 		rebuildGeometry();
 		updateRingLine();
+		updateOverlays();
 		render();
 	}, false);
 
@@ -594,6 +635,7 @@ onMounted(() => {
 	renderer.domElement.addEventListener('pointerup', onPointerUpWithDragCheck);
 
 	rebuildGeometry();
+	updateOverlays();
 	render();
 
 	window.addEventListener('resize', onResize);

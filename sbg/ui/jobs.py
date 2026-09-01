@@ -18,17 +18,50 @@ _executor = ThreadPoolExecutor(max_workers=2)
 _jobs = {}
 _lock = threading.Lock()
 
+# to_dict() re-sends the log on every 2s poll, so a long run (N wind directions x
+# verbose polish output) would ship the whole thing repeatedly. Send only the tail;
+# `log_total` tells the client how much it is not seeing.
+LOG_TAIL_LINES = 400
+
+
+class JobCancelled(Exception):
+    """Raised inside a worker when the user asked it to stop."""
+
 
 class Job:
     def __init__(self, job_id):
         self.id = job_id
-        self.status = "pending"  # pending | running | done | error
+        self.status = "pending"  # pending | running | done | error | cancelled
+        # COOPERATIVE cancellation. A Python thread cannot be killed, and the heavy
+        # stages (voxel remesh, decimate, boolean) are single calls into C++ that will
+        # not return early -- so "Cancel" means "stop at the next stage boundary", which
+        # can be several seconds to a couple of minutes away on a big domain. Saying so
+        # honestly in the UI beats a button that looks instant and is not.
+        self.cancel_requested = False
         self.stage = None
+        # Optional finer-grained progress WITHIN a stage -- e.g. which wind direction
+        # of N is being clipped. Without it a 16-direction run shows "clip" for forty
+        # minutes with no sense of movement.
+        self.substage = None
         self.log = []
         self.result = None
         self.error = None
         self.created_at = datetime.now(timezone.utc).isoformat()
         self._stage_started_at = None
+
+    def cancel(self):
+        """Request a stop. Returns False if the job already finished."""
+        with _lock:
+            if self.status in ("done", "error", "cancelled"):
+                return False
+            self.cancel_requested = True
+            self.log.append("[cancel] requested -- stopping at the next stage boundary")
+            return True
+
+    def raise_if_cancelled(self):
+        """Call between stages. The runner turns this into status='cancelled'."""
+        if self.cancel_requested:
+            raise JobCancelled()
 
     def set_stage(self, stage):
         """Automatically logs how long the PREVIOUS stage took, every time a
@@ -43,6 +76,12 @@ class Job:
                 elapsed = now - self._stage_started_at
                 self.log.append(f"[{self.stage}] took {elapsed:.1f}s")
             self.stage = stage
+            self.substage = None
+            _cancel = self.cancel_requested
+        # Outside the lock: every stage transition is a cancellation checkpoint, so a
+        # pipeline gets this for free without any per-stage checking code.
+        if _cancel:
+            raise JobCancelled()
             self._stage_started_at = now
             self.log.append(stage)
 
@@ -56,7 +95,10 @@ class Job:
                 "id": self.id,
                 "status": self.status,
                 "stage": self.stage,
-                "log": list(self.log),
+                "substage": self.substage,
+                "cancel_requested": self.cancel_requested,
+                "log": self.log[-LOG_TAIL_LINES:],
+                "log_total": len(self.log),
                 "result": self.result,
                 "error": self.error,
                 "created_at": self.created_at,
@@ -79,6 +121,10 @@ def create_job(fn, *args, **kwargs):
         try:
             job.result = fn(job, *args, **kwargs)
             job.status = "done"
+        except JobCancelled:
+            # A user-requested stop is not a failure -- distinct status, no traceback.
+            job.status = "cancelled"
+            job.log_line("[cancel] stopped")
         except Exception as e:
             job.status = "error"
             job.error = str(e)

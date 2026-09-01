@@ -38,7 +38,8 @@ import numpy as np
 import openmc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from read_particle_tracks import by_name, read_items, read_tracks, residence_time
+from read_particle_tracks import (by_name, load_wind, read_items, read_tracks,
+                                  residence_time, to_world)
 
 XS = "/home/quentin/nuclear_data/cross_sections.xml"
 
@@ -97,6 +98,107 @@ def source_strengths(tracks, origin, bins, lo_m, hi_m):
     return mesh, s, diag, n_tracks
 
 
+def input_hashes(**paths):
+    """{name: {path, sha256, bytes}} for the files a run consumed.
+
+    A dose map is otherwise untraceable: the STL, the .h5m and the tracks XML all get
+    regenerated in place, so a result on disk cannot prove which geometry produced it.
+    Streamed in 1 MB chunks -- the tracks XML is ~90 MB and the .h5m larger.
+    """
+    import hashlib
+    out = {}
+    for name, p in paths.items():
+        if not p:
+            continue
+        f = Path(p)
+        if not f.is_file():
+            out[name] = {"path": str(p), "sha256": None, "error": "not found"}
+            continue
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        out[name] = {"path": str(f.resolve()), "sha256": h.hexdigest(),
+                     "bytes": f.stat().st_size}
+    return out
+
+
+def resolve_extent(h5m, wind_path=None, lo=None, hi=None, zlo=None, ztop=250.0):
+    """-> (lo_m, hi_m, W, origin_m, description).
+
+    Resolution ladder, most explicit first: CLI --lo/--hi -> the wind sidecar -> the STL
+    beside the .h5m -> the Kent Ridge values this script used to hardcode.
+
+    THE FRAME. If the domain was wind-aligned, the STL was exported already rotated, so
+    the .h5m, the Fluent case and the particle tracks ALL live in the rotated frame.
+    Everything downstream therefore stays rotated -- un-rotating tracks before binning
+    would put the source where the geometry is not and every photon would start in a
+    vacuum. Un-rotation belongs at map export only (read_dose.py). Bonus: in the rotated
+    frame the domain is exactly axis-aligned, so a RegularMesh fits it with no waste.
+
+    `zlo` is the source-mesh FLOOR. Its old default of 20.0 is Kent Ridge's ground
+    elevation: on a domain whose ground sits lower, every source point beneath it is
+    silently discarded as "outside the mesh" -- and that is precisely the near-ground
+    plume the whole groundshine map is built from. When a sidecar exists the mesh's own
+    zmin is used instead; without one the legacy default is preserved so pre-wind runs
+    reproduce bit for bit.
+    """
+    stem = str(h5m).rsplit(".", 1)[0]
+    origin = np.array(json.load(open(stem + ".transform.json"))["origin_m"])
+    W = load_wind(wind_path or (stem + ".wind.json"))
+
+    if zlo is None:
+        zlo = float(W["mesh_bounds_rotated"]["zmin"]) if W else 20.0
+
+    if lo is not None and hi is not None:
+        return np.asarray(lo, float), np.asarray(hi, float), W, origin, "--lo/--hi"
+    if W is not None:
+        d = W["domain_rotated"] if W.get("clipped") else W["mesh_bounds_rotated"]
+        return (np.array([d["xmin"], d["ymin"], zlo]),
+                np.array([d["xmax"], d["ymax"], ztop]), W, origin,
+                f"wind sidecar (wind from {W['wind_from_deg']:g}, rotated frame)")
+
+    # No sidecar: fall back to the STL beside the .h5m. The stem may or may not carry a
+    # suffix (cfd.h5m sits next to cfd_watertight.stl), so try the obvious names.
+    hit = next((p for p in (Path(stem + s) for s in (".stl", "_watertight.stl", "_raw.stl"))
+                if p.is_file()), None)
+    if hit is not None:
+        import trimesh
+        b = trimesh.load(str(hit), process=False).bounds
+        return (np.array([b[0][0], b[0][1], zlo]), np.array([b[1][0], b[1][1], ztop]),
+                None, origin, f"{hit.name} bounding box (no wind sidecar)")
+
+    # Last resort: the Kent Ridge domain's exact XY bounds, so pre-wind runs reproduce
+    # bit for bit -- but they are domain-specific and wrong for anything else.
+    return (np.array([21712.5, 30255.4, zlo]), np.array([22112.5, 30655.4, ztop]), None,
+            origin, "LEGACY HARDCODED Kent Ridge bounds -- pass --lo/--hi for any other domain")
+
+
+def terrain_ztop(dtm_path, lo_m, hi_m, W, receptor_h, zbin, fallback):
+    """Top of the receptor column stack: the highest ground in the domain plus headroom.
+
+    Sized from the TERRAIN, not from the mesh's zmax (the tallest building) -- at Kent
+    Ridge that would stretch the stack from 30 to 51 bins and cost ~1.3x relative error
+    for cells no receptor is ever read from. Returns `fallback` when the DTM is
+    unreadable, or whenever there is no wind sidecar, so pre-wind runs are unchanged.
+    """
+    if W is None:
+        return fallback, f"legacy default ({fallback:g} m)"
+    try:
+        import rasterio
+        # Corners are enough: the DTM is smooth at 20 m native, and this only sets a
+        # ceiling with headroom on top. Un-rotate first -- the DTM is true EPSG:3414.
+        gx, gy = np.meshgrid(np.linspace(lo_m[0], hi_m[0], 40),
+                             np.linspace(lo_m[1], hi_m[1], 40), indexing="ij")
+        w = to_world(np.column_stack([gx.ravel(), gy.ravel(), np.zeros(gx.size)]), W)
+        with rasterio.open(dtm_path) as r:
+            g = np.array([v[0] for v in r.sample(w[:, :2])], dtype=float)
+        top = float(np.nanmax(g)) + receptor_h + 2.0 * zbin
+        return top, f"max terrain {np.nanmax(g):.1f} m + {receptor_h:g} m + 2 bins"
+    except Exception as e:
+        return fallback, f"DTM unreadable ({e}); fell back to {fallback:g} m"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tracks", default="data/openmc_data/particles3.xml")
@@ -109,24 +211,45 @@ def main():
     ap.add_argument("--tally-bin", type=float, default=10.0, help="tally cell size [m]")
     ap.add_argument("--receptor-h", type=float, default=1.5,
                     help="receptor height above LOCAL grade [m]")
-    ap.add_argument("--tally-ztop", type=float, default=80.0,
-                    help="top of the tally column stack [m]; must clear the highest terrain")
+    ap.add_argument("--tally-ztop", type=float, default=None,
+                    help="top of the tally column stack [m]; must clear the highest "
+                         "terrain. Default: max terrain + receptor height + 2 bins when a "
+                         "wind sidecar is present, else the legacy 80 m")
     ap.add_argument("--tally-zbin", type=float, default=2.0, help="tally z bin [m]")
     ap.add_argument("--run", action="store_true", help="invoke the openmc CLI after export")
+    ap.add_argument("--lo", default=None, help="source-mesh lower corner 'x,y,z' [m]")
+    ap.add_argument("--hi", default=None, help="source-mesh upper corner 'x,y,z' [m]")
+    ap.add_argument("--src-zlo", type=float, default=None,
+                    help="source-mesh floor [m]. Default: the mesh's own zmin when a wind "
+                         "sidecar is present, else the legacy 20 m (Kent Ridge's ground)")
+    ap.add_argument("--dtm", default="data/dtm.tif",
+                    help="DTM used to size the tally column stack")
+    ap.add_argument("--src-ztop", type=float, default=250.0, help="source-mesh ceiling [m]")
+    ap.add_argument("--wind", default=None,
+                    help="a <stem>.wind.json sidecar (defaults to one beside --h5m). "
+                         "Supplies the domain extent AND records the frame in run_meta.")
     a = ap.parse_args()
 
-    T = json.load(open(str(a.h5m).rsplit(".", 1)[0] + ".transform.json"))
-    origin = np.array(T["origin_m"])
-
-    # Source mesh spans the plume; tally mesh is a thin ground-level slab.
-    lo_m = np.array([21712.5, 30255.4, 20.0])
-    hi_m = np.array([22112.5, 30655.4, 250.0])
+    lo_cli = [float(v) for v in a.lo.split(",")] if a.lo else None
+    hi_cli = [float(v) for v in a.hi.split(",")] if a.hi else None
+    lo_m, hi_m, W, origin, src = resolve_extent(
+        a.h5m, a.wind, lo_cli, hi_cli, zlo=a.src_zlo, ztop=a.src_ztop)
+    print(f"domain extent from {src}")
+    print(f"  lo {np.round(lo_m, 1).tolist()}  hi {np.round(hi_m, 1).tolist()}")
     bins = np.maximum(np.round((hi_m - lo_m) / a.src_bin), 1).astype(int)
 
     mesh, strengths, diag, n_tracks = source_strengths(a.tracks, origin, bins, lo_m, hi_m)
     print(f"source: {diag['points']:,} points / {diag['tracks']:,} tracks")
+    frac_out = 100 * diag["outside"] / diag["total_residence"]
     print(f"  residence {diag['total_residence']:.4g} particle-s "
-          f"({100*diag['outside']/diag['total_residence']:.2f}% fell outside the mesh)")
+          f"({frac_out:.2f}% fell outside the mesh)")
+    # Losing a few tenths of a percent at the edges is normal. Losing several percent
+    # almost always means the source mesh floor is above the local ground, which silently
+    # discards exactly the near-ground plume the groundshine map is built from.
+    if frac_out > 2.0:
+        print(f"  !! WARNING: {frac_out:.1f}% of residence time is outside the source "
+              f"mesh (z {lo_m[2]:.1f}..{hi_m[2]:.1f} m). If the ground here sits below "
+              f"{lo_m[2]:.1f} m, raise the domain or pass --src-zlo.")
     print(f"  mesh {tuple(bins)} = {diag['cells']:,} cells, {diag['occupied']:,} occupied "
           f"({100*diag['occupied']/diag['cells']:.1f}%)")
 
@@ -188,7 +311,12 @@ def main():
     # stack; read_dose.py then ray-casts the ground per column and picks the bin at
     # local grade + receptor height, giving a genuinely terrain-following map.
     tb = np.maximum(np.round((hi_m[:2] - lo_m[:2]) / a.tally_bin), 1).astype(int)
-    zlo, zhi = lo_m[2], a.tally_ztop
+    zhi, ztop_src = terrain_ztop(a.dtm, lo_m, hi_m, W, a.receptor_h, a.tally_zbin,
+                                 fallback=a.tally_ztop if a.tally_ztop else 80.0)
+    if a.tally_ztop:
+        zhi, ztop_src = a.tally_ztop, "--tally-ztop"
+    zlo = lo_m[2]
+    print(f"  tally column stack top {zhi:.1f} m from {ztop_src}")
     nz = int(round((zhi - zlo) / a.tally_zbin))
     gm = openmc.RegularMesh()
     gm.lower_left = tuple(np.append((lo_m[:2] - origin[:2]) * 100.0, zlo * 100.0))
@@ -207,7 +335,11 @@ def main():
                 tally_cell_cm3=float(np.prod(
                     (np.array(gm.upper_right) - np.array(gm.lower_left)) / np.array(gm.dimension))),
                 origin_m=origin.tolist(), lo_m=lo_m.tolist(), hi_m=hi_m.tolist(),
+                wind=({'wind_from_deg': W['wind_from_deg'], 'psi_deg': W['psi_deg'],
+                       'rotation': W['rotation']} if W else None),
                 tally_dim=list(gm.dimension), n_tracks=n_tracks,
+                inputs=input_hashes(stl=Path("data/openmc_data/cfd_watertight.stl"),
+                                    h5m=a.h5m, tracks=a.tracks),
                 tally_z=[zlo, zhi, nz], receptor_h=a.receptor_h,
                 stl=str(Path("data/openmc_data/cfd_watertight.stl").resolve()))
     json.dump(meta, open(d / "run_meta.json", "w"), indent=2)

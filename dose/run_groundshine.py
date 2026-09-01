@@ -50,8 +50,10 @@ import numpy as np
 import openmc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from read_particle_tracks import by_name, read_items, read_tracks, residence_time
-from run_dose import E_GAMMA, XS, YIELD, materials
+from read_particle_tracks import (by_name, load_wind, read_items, read_tracks,
+                                  residence_time, to_world)
+from run_dose import (E_GAMMA, XS, YIELD, input_hashes, materials,
+                      resolve_extent)
 
 # Reference height for v_d. Deposition velocity is conventionally quoted against the
 # concentration at a stated height; 1 m is the usual choice for ground-level work.
@@ -106,13 +108,19 @@ def main():
     ap.add_argument("--receptor-h", type=float, default=1.5)
     ap.add_argument("--tally-ztop", type=float, default=80.0)
     ap.add_argument("--tally-zbin", type=float, default=2.0)
+    ap.add_argument("--src-zlo", type=float, default=None,
+                    help="source-mesh floor [m]; see run_dose.py::resolve_extent")
+    ap.add_argument("--wind", default=None,
+                    help="a <stem>.wind.json sidecar (defaults to one beside --h5m). "
+                         "Supplies the domain extent AND records the frame in run_meta.")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
 
-    T = json.load(open(str(a.h5m).rsplit(".", 1)[0] + ".transform.json"))
-    origin = np.array(T["origin_m"])
-    lo_m = np.array([21712.5, 30255.4, 20.0])
-    hi_m = np.array([22112.5, 30655.4, 250.0])
+    # Same resolution ladder as run_dose.py (CLI -> wind sidecar -> STL bbox -> legacy
+    # Kent Ridge), shared rather than duplicated so the two cannot drift apart.
+    lo_m, hi_m, W, origin, src = resolve_extent(a.h5m, a.wind, zlo=a.src_zlo)
+    print(f"domain extent from {src}")
+    print(f"  lo {np.round(lo_m, 1).tolist()}  hi {np.round(hi_m, 1).tolist()}")
 
     # ---- near-surface air concentration -----------------------------------------
     g, dims, n_tracks, total_res = residence_grid(a.tracks, lo_m, hi_m,
@@ -130,9 +138,17 @@ def main():
     sy = lo_m[1] + (np.arange(nsy) + 0.5) * a.src_bin
     SX, SY = np.meshgrid(sx, sy, indexing="ij")
 
+    # SX/SY are in the tally frame, which for a wind-aligned domain is the ROTATED one.
+    # `data/dtm.tif` is a static island-wide raster in TRUE EPSG:3414 that nothing
+    # rotates, so it must be sampled at un-rotated coordinates -- otherwise every column
+    # gets the grade of a different physical place (~383 m off at 500 m out on a 45 deg
+    # bearing). Only the DTM lookup moves; the deposition source itself stays rotated,
+    # because the DAGMC geometry it emits into is rotated. `to_world` is a no-op when
+    # W is None, so a non-wind run is unaffected.
     import rasterio
+    SW = to_world(np.column_stack([SX.ravel(), SY.ravel(), np.zeros(SX.size)]), W)
     with rasterio.open(a.dtm) as r:
-        grade = np.array([v[0] for v in r.sample(np.column_stack([SX.ravel(), SY.ravel()]))],
+        grade = np.array([v[0] for v in r.sample(SW[:, :2])],
                          dtype=float).reshape(nsx, nsy)
 
     # sample C at grade + VD_REF_H, interpolating in z (bin centres)
@@ -224,6 +240,10 @@ def main():
                        (np.array(gm.upper_right) - np.array(gm.lower_left)) / np.array(gm.dimension))),
                    origin_m=origin.tolist(), lo_m=lo_m.tolist(), hi_m=hi_m.tolist(),
                    tally_dim=list(gm.dimension), n_tracks=n_tracks,
+                   inputs=input_hashes(stl=a.stl, h5m=a.h5m, tracks=a.tracks),
+                   # read_dose.py needs this to un-rotate before sampling the DTM.
+                   wind=({"wind_from_deg": W["wind_from_deg"], "psi_deg": W["psi_deg"],
+                          "rotation": W["rotation"]} if W else None),
                    tally_z=[lo_m[2], a.tally_ztop, nz], receptor_h=a.receptor_h,
                    stl=str(Path(a.stl).resolve())), open(d / "run_meta.json", "w"), indent=2)
     print(f"\nwrote XML to {d}/  ({tb}x{tb}x{nz} tally)")

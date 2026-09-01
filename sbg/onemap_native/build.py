@@ -114,183 +114,213 @@ def _polygon_clip_solid(domain_polygon, z_lo, z_hi):
     return mn.meshFromFacesVerts(prism.faces, prism.vertices)
 
 
-def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
-                     target_reduction=0.97, decimate_error=2.5, workers=6,
-                     store_dir=None, workdir=None, log=None, include_base=True,
-                     fuse_backend="meshlib",
-                     placement="drape", coupling_lambda=None):
-    """Run the full tile-native pipeline for one domain polygon (EPSG:3414)."""
-    import time
-    _sink = log
-    _t = [time.perf_counter()]
 
-    def log(msg):  # flushing + per-phase timing wrapper
-        now = time.perf_counter()
-        line = f"{msg}  (+{now - _t[0]:.1f}s)"
-        _t[0] = now
-        if _sink is None:
-            print(line, flush=True)
-        else:
-            _sink(line)
 
-    workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="onemap_native_"))
-    workdir.mkdir(parents=True, exist_ok=True)
+def _provenance(store_dir=None, opts=None):
+    """Fields identifying WHAT produced an STL, for every sidecar.
 
-    xmin, ymin, xmax, ymax = domain_polygon.bounds
-    lons, lats = _svy_to_wgs.transform([xmin, xmax], [ymin, ymax])
-    log(f"[tiles] walking tileset for domain...")
-    leaves = domain_leaf_tiles(min(lons), min(lats), max(lons), max(lats))
-    log(f"[tiles] {len(leaves)} leaf tiles cover the domain")
+    An STL carries no metadata (80-byte header, then triangles), so a shipped mesh is
+    otherwise untraceable: a year later nobody can say which store, which options or
+    which commit made it. Cheap to record, impossible to reconstruct after the fact.
+    """
+    import subprocess
+    from datetime import datetime, timezone
 
-    src = "precomputed store" if store_dir else f"{workers} live workers"
-    log(f"[extract] whole-mesh extraction ({src}, correct transform, clip)...")
-    _t_ext = [__import__("time").perf_counter()]
+    def _git(*args):
+        try:
+            return subprocess.run(("git", *args), cwd=Path(__file__).resolve().parent,
+                                  capture_output=True, text=True, timeout=5,
+                                  check=True).stdout.strip() or None
+        except Exception:
+            return None
 
-    def _prog(done, total):
-        import time as _tm
-        filled = int(28 * done / total)
-        bar = "█" * filled + "░" * (28 - filled)
-        rate = done / max(_tm.perf_counter() - _t_ext[0], 1e-6)
-        eta = (total - done) / rate if rate else 0
-        end = "\n" if done == total else "\r"
-        print(f"    [{bar}] {done}/{total} tiles ({100*done//total}%)  ~{eta:4.0f}s left ",
-              end=end, flush=True)
+    store = None
+    if store_dir and Path(store_dir).is_dir():
+        # mtime of the store root is a cheap stand-in for "which tile download built
+        # this" -- hashing a 2.6 GB tree on every build is not worth it.
+        store = {"path": str(store_dir),
+                 "mtime_utc": datetime.fromtimestamp(Path(store_dir).stat().st_mtime,
+                                                     timezone.utc).isoformat()}
+    return {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git("rev-parse", "HEAD"),
+        "git_dirty": bool(_git("status", "--porcelain")),
+        "store": store,
+        "options": dict(opts or {}),
+    }
 
-    pieces = extract_domain_buildings(leaves, domain_polygon, workers=workers,
-                                      progress=_prog, store_dir=store_dir)
-    log(f"[extract] {len(pieces)} building pieces")
 
-    log(f"[terrain] building DTM + conforming terrain (footprint-constrained)...")
-    grid_z, affine = build_domain_dtm((xmin, ymin, xmax, ymax), step=step)
-    dtm = DtmSampler(grid_z, affine)
-    # Skirts exist ONLY to guarantee volume overlap into the slab so the voxel
-    # remesh fuses building and terrain. The raw (voxel_size <= 0) export does no
-    # fusion, and there the skirt actively HURTS: it is built from the same
-    # footprint ring as the building it wraps, so the two share vertices and weld
-    # into each other, leaving both open. Measured on the 2km CBD domain (component
-    # closure, no cross-object weld): with skirts 2,921/2,973 closed (52 open);
-    # without, 1,301/1,303 closed (2 open -- the pieces seal_piece cannot fully
-    # close). The building already sits exactly on its pad regardless (base at
-    # pad_z, pad flattened to pad_z), so nothing floats without the skirt.
-    # `placement` picks how a connected structure spanning real relief is levelled
-    # -- "group" (default, bridges stay coplanar), "drape" (no grouping, hillside
-    # strings terrace but bridges shear), or "laplacian" (soft coupling, one lambda
-    # knob, both cases resolve without being classified). See
-    # place_on_terrain_conforming's docstring and TERRAIN.md section 3.
-    bld_v, bld_f, terr_v, terr_f = place_on_terrain_conforming(
-        pieces, dtm, domain_polygon, skirt=voxel_size > 0,
-        mode=placement, coupling_lambda=coupling_lambda)
-    _lam = ("" if placement != "laplacian"
-            else f" lambda={coupling_lambda if coupling_lambda is not None else COUPLING_LAMBDA:g}")
-    log(f"[terrain] DTM {grid_z.shape} elev {np.nanmin(grid_z):.0f}-{np.nanmax(grid_z):.0f}m, "
-        f"{len(pieces)} pieces placed, {len(terr_f):,} terrain triangles "
-        f"(placement={placement}{_lam})")
+def _write_build_sidecar(stl_path, domain_poly, core_poly, h_exact, log,
+                         store_dir=None, opts=None):
+    """`<stem>.build.json` for a plain (non-wind) build.
 
-    # Extrude the terrain surface down to a FLAT plane (not a fixed-thickness
-    # slab -- a hilltop gets a tall column, low ground gets a short one, "to
-    # scale"). Replaces Blender's SOLIDIFY step for terrain entirely (a
-    # uniform-thickness modifier can't express "extrude to an absolute Z
-    # plane"). base_z is NOT hardcoded 0 -- a building's plunge skirt can
-    # reach PLUNGE_M below its own pad_z, and on low-lying ground that can go
-    # negative (measured: -10m on a real domain); a hard z=0 floor left those
-    # skirts poking through the terrain solid's own sealed bottom cap (a real,
-    # visible hole -- confirmed both numerically, via bld_v's own min z, and
-    # visually in a raw render). base_z instead tracks the lowest point any
-    # building actually reaches, with a margin, so the flat floor always sits
-    # AT OR BELOW every skirt -- still exactly 0 on ordinary terrain (nothing
-    # dips below), only drops lower where something genuinely needs it to.
-    base_z = min(0.0, float(bld_v[:, 2].min()) - 1.0) if len(bld_v) else 0.0
-    terr_v, terr_f = terrain_flat_base_solid(terr_v, terr_f, domain_polygon, base_z=base_z)
-    log(f"[terrain] flat-base solid: z {base_z:.0f}-{terr_v[:, 2].max():.0f}m, {len(terr_f):,} faces")
-
-    # High-fidelity raw mode (voxel_size <= 0): skip the whole watertight machinery
-    # (Blender voxel remesh + meshlib decimate/clip/polish) and dump the terrain +
-    # real OneMap building meshes straight to STL. Preserves full LiDAR detail, is
-    # fast (no Blender), but is a non-watertight triangle soup -- for eyeballing the
-    # real geometry, not for CFD meshing.
-    if voxel_size is not None and voxel_size <= 0:
-        import trimesh
-        # include_base is honoured here too -- raw mode used to always write the
-        # terrain, which is why the UI had to grey the checkbox out. There is no
-        # fuse step to back the buildings, so dropping terrain is just not writing
-        # it (unlike the watertight path, where terrain stays in the Blender join
-        # and is boolean-subtracted at the end).
-        if include_base:
-            verts = np.vstack([terr_v, bld_v])
-            faces = np.vstack([terr_f, bld_f + len(terr_v)])
-        else:
-            verts, faces = bld_v, bld_f
-        trimesh.Trimesh(verts, faces, process=False).export(str(out_stl))
-        log(f"[raw] high-fidelity NON-watertight mesh: {len(faces):,} faces "
-            f"({'with' if include_base else 'without'} ground plane; "
-            f"skipped fuse/decimate/clip/polish)")
-        log(f"[done] {out_stl}  (raw high-fidelity soup -- not watertight by design)")
-        return out_stl
-
+    A wind build already gets `<stem>.wind.json`, which carries the same provenance plus
+    the rotation. This is the equivalent for everything else -- without it a normal build
+    ships a bare STL with no record of the domain that produced it, which is the single
+    thing a scientist needs to reproduce or cite a result.
+    """
+    import json
     import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mn
 
-    # Terrain is needed again at the very end when include_base=False (it gets
-    # boolean-subtracted from the final export) and MUST come from these original
-    # in-memory arrays, not a PLY round-trip -- reloading the exported terrain.ply
-    # was tried first and came back with real defects (holes=4, multiEdges=True)
-    # that were never present in memory, from binary PLY float32 precision loss on
-    # coincident boundary/wall vertices.
-    _terr_v_keep, _terr_f_keep = (terr_v, terr_f) if not include_base else (None, None)
+    doc = {"version": 1, "kind": "sbg.build", "crs": "EPSG:3414", "units": "m",
+           "domain_ring_m": np.asarray(domain_poly.exterior.coords,
+                                       dtype=float)[:, :2].tolist(),
+           "core_roi_ring_m": np.asarray(core_poly.exterior.coords,
+                                         dtype=float)[:, :2].tolist(),
+           "tallest_building_m": float(h_exact), "wind": None,
+           **_provenance(store_dir, opts)}
+    try:
+        ml = mr.loadMesh(str(stl_path))
+        v = mn.getNumpyVerts(ml)
+        holes = len(ml.topology.findHoleRepresentiveEdges())
+        doc.update(watertight=holes == 0, holes=holes,
+                   faces=int(ml.topology.numValidFaces()),
+                   mesh_bounds_m={"xmin": float(v[:, 0].min()), "xmax": float(v[:, 0].max()),
+                                  "ymin": float(v[:, 1].min()), "ymax": float(v[:, 1].max()),
+                                  "zmin": float(v[:, 2].min()), "zmax": float(v[:, 2].max())})
+    except Exception as e:                       # a raw/soup export may not load cleanly
+        doc["mesh_stats_error"] = str(e)
 
-    if fuse_backend == "meshlib":
-        # No subprocess, no PLY round-trip, no Blender install. Same OpenVDB
-        # algorithm Blender's REMESH modifier uses -- see _fuse_meshlib.
-        mesh = _fuse_meshlib(terr_v, terr_f, bld_v, bld_f, voxel_size, log)
-        del terr_v, terr_f, bld_v, bld_f, pieces
-        import gc
-        gc.collect()
+    p = Path(stl_path).with_suffix(".build.json")
+    p.write_text(json.dumps(doc, indent=2))
+    log(f"[sidecar] {p.name}")
+    return p
+
+
+def _write_wind_sidecar(stl_path, wind_from_deg, psi_deg, centre, core_poly,
+                        rect_rot, wind, h_exact, log, clipped=True,
+                        store_dir=None, opts=None):
+    """Write `<stem>.wind.json` next to an STL. Returns a dict describing the output.
+
+    Written HERE and not in the UI job layer, because the rotation is a property of the
+    geometry -- a CLI run must produce it too. Deliberately a different suffix from
+    dose/stl_to_h5m.py's `<stem>.transform.json`, so the two compose by stem without
+    clashing: wind_225.stl -> wind_225.wind.json (geo frame, this file) plus
+    wind_225.transform.json (units/origin, written later in the pymoab env).
+
+    THE FRAME, stated once so nobody has to re-derive it: the STL vertices are ALREADY
+    rotated. The .h5m, Fluent, the particle tracks and any tally mesh therefore all live
+    in the ROTATED frame. Apply `inverse` ONLY when producing a georeferenced product --
+    un-rotating tracks before binning would place the source where the geometry is not.
+    """
+    import json
+    import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mn
+    from sbg.onemap_native.wind import rot2, rotate_xy
+
+    ml = mr.loadMesh(str(stl_path))
+    v = mn.getNumpyVerts(ml)
+    holes = len(ml.topology.findHoleRepresentiveEdges())
+    R = rot2(psi_deg)
+    x0, y0, x1, y1 = rect_rot.bounds
+    core_ring = np.asarray(core_poly.exterior.coords, dtype=float)[:, :2]
+    core_rot = rotate_xy(core_ring, psi_deg, centre)
+
+    doc = {
+        "version": 1, "kind": "sbg.wind_domain", "crs": "EPSG:3414", "units": "m",
+        **_provenance(store_dir, opts),
+        "wind_from_deg": float(wind_from_deg),
+        "psi_deg": float(psi_deg),
+        "convention": ("wind_from_deg is METEOROLOGICAL: the compass bearing the wind "
+                       "blows FROM, clockwise from grid north. psi_deg = "
+                       "(wind_from_deg + 180) % 360 is the bearing the flow travels "
+                       "TOWARD, and is the CCW rotation applied to world XY so that the "
+                       "flow ends up along +Y."),
+        "rotation": {
+            "centre_m": [float(centre[0]), float(centre[1])],
+            "axis": "z",
+            "forward_matrix": [[float(R[0, 0]), float(R[0, 1])],
+                               [float(R[1, 0]), float(R[1, 1])]],
+            "inverse_matrix": [[float(R[0, 0]), float(R[1, 0])],
+                               [float(R[0, 1]), float(R[1, 1])]],
+            "forward": "p_rot_xy = forward_matrix @ (p_world_xy - centre_m) + centre_m; z unchanged",
+            "inverse": "p_world_xy = inverse_matrix @ (p_rot_xy - centre_m) + centre_m; z unchanged",
+            "note": ("The STL vertices are ALREADY in the rotated frame, and so are the "
+                     ".h5m, the Fluent case and the particle tracks. Apply `inverse` only "
+                     "when producing a georeferenced product (e.g. a dose map on a real "
+                     "basemap). Do NOT un-rotate tracks before binning them -- the OpenMC "
+                     "geometry lives in this rotated frame."),
+        },
+        "clipped": bool(clipped),
+        "mesh_bounds_rotated": {
+            "xmin": float(v[:, 0].min()), "xmax": float(v[:, 0].max()),
+            "ymin": float(v[:, 1].min()), "ymax": float(v[:, 1].max()),
+            "zmin": float(v[:, 2].min()), "zmax": float(v[:, 2].max()),
+        },
+        "core_roi": {
+            "ring_world_m": core_ring.tolist(),
+            "rotated_bounds": {"xmin": float(core_rot[:, 0].min()),
+                               "xmax": float(core_rot[:, 0].max()),
+                               "ymin": float(core_rot[:, 1].min()),
+                               "ymax": float(core_rot[:, 1].max())},
+        },
+        "buffer": {
+            "upwind_m": float(wind["up_m"]), "downwind_m": float(wind["down_m"]),
+            "lateral_m": float(wind["lat_m"]),
+            "H_m": float(h_exact),
+            "H_source": "tallest extracted building (max vertex z - piece base_z)",
+            "contents": "terrain only, no buildings",
+            "guidance": "COST 732 / Franke et al. (2007) urban CFD best practice",
+        },
+        "watertight": holes == 0, "holes": holes, "faces": int(ml.topology.numValidFaces()),
+    }
+    if clipped:
+        doc["domain_rotated"] = {
+            "xmin": float(x0), "xmax": float(x1), "ymin": float(y0), "ymax": float(y1),
+            "inlet": {"face": "ymin", "y": float(y0), "flow_normal": [0, 1, 0]},
+            "outlet": {"face": "ymax", "y": float(y1)},
+            "lateral": ["xmin", "xmax"],
+        }
+        doc["boundary_conditions"] = {
+            "inlet": {"face": "ymin",
+                      "fluent": "Velocity Inlet, Magnitude Normal to Boundary",
+                      "note": ("Geometry is pre-rotated so the wind is always +Y. The "
+                               "Fluent setup is IDENTICAL for every direction.")},
+            "ground_roughness": {
+                "z0_m": float(wind.get("z0_m", 0.7)),
+                "advisory": True,
+                "basis": ("urban/suburban aerodynamic roughness length. The buffer is bare "
+                          "terrain with no buildings, so upstream roughness must be "
+                          "supplied as a wall BC. The mesh does NOT encode this."),
+                "fluent_hint": ("sand-grain Ks = 9.793 * z0 / Cs (Cs default 0.5). Check "
+                                "the first cell height exceeds Ks or the rough-wall law "
+                                "is invalid."),
+            },
+        }
     else:
-        terr_ply = workdir / "terrain.ply"
-        bld_ply = workdir / "buildings.ply"
-        _write_scene_ply(terr_ply, bld_ply, terr_v, terr_f, bld_v, bld_f)
-        log(f"[scene] wrote terrain+buildings PLY "
-            f"({(terr_ply.stat().st_size + bld_ply.stat().st_size) / 1e6:.0f} MB)")
-        # free the big geometry arrays before spawning Blender -- keeps this
-        # process's RSS low while Blender does its memory-heavy remesh.
-        del terr_v, terr_f, bld_v, bld_f, pieces
-        import gc
-        gc.collect()
+        doc["note_unclipped"] = (
+            "RAW mode performs no clip, so the mesh extent is the BUILD ENVELOPE, not the "
+            "wind rectangle, and 'inlet = ymin' is not a claim about its walls. This is "
+            "fine for Ansys fault-tolerant meshing and snappyHexMesh, which build their "
+            "own enclosure / background mesh; it is not a watertight CFD domain.")
 
-        # Fuse to PLY (welded/indexed) not STL (per-triangle soup). The voxel-remesh
-        # output is perfectly watertight; STL un-welds it and re-welding in trimesh
-        # manufactures hundreds of SPURIOUS non-manifold edges. PLY carries Blender's
-        # clean welding straight through.
-        raw_ply = workdir / "fused.ply"
-        log(f"[blender] fusing (join + voxel remesh {voxel_size}m -> watertight PLY)...")
-        subprocess.run(
-            [str(BLENDER_PATH), "--background", "--python", str(_FUSE_SCRIPT), "--",
-             "--terrain", str(terr_ply), "--buildings", str(bld_ply), "--output", str(raw_ply),
-             "--voxel-size", str(voxel_size), "--skip-terrain-solidify",
-             "--skip-debris"],  # clip's keep-largest handles debris; skip the ~30s Blender split
-            check=True,
-        )
-        log(f"[blender] fuse done")
-        mesh = mr.loadMesh(str(raw_ply))
+    p = Path(stl_path).with_suffix(".wind.json")
+    p.write_text(json.dumps(doc, indent=2))
+    log(f"[sidecar] {p.name}  (wind from {wind_from_deg:g}, "
+        f"{'watertight' if holes == 0 else f'{holes} holes'})")
+    return {"wind_from_deg": float(wind_from_deg), "stl": str(stl_path),
+            "sidecar": str(p), "watertight": holes == 0, "holes": holes,
+            "faces": int(ml.topology.numValidFaces())}
 
-    # meshlib manifold-preserving decimation -- replaces fast_simplification +
-    # pymeshfix ENTIRELY. meshlib's half-edge topology literally cannot represent
-    # a non-manifold edge, so decimation stays watertight BY CONSTRUCTION (FQMS/
-    # meshopt broke it -> 351 non-manifold + 613 holes -> forced a slow ~45s
-    # pymeshfix global rebuild). Same face count, watertight, no repair needed.
-    log(f"[decimate] meshlib manifold-preserving decimation (stays watertight, no pymeshfix)...")
-    nf0 = mesh.topology.numValidFaces()
-    ds = mr.DecimateSettings()
-    ds.maxDeletedFaces = int(nf0 * target_reduction)
-    ds.maxError = decimate_error
-    mr.decimateMesh(mesh, ds)
-    log(f"[decimate] {nf0} -> {mesh.topology.numValidFaces()} faces, "
-        f"holes={len(mesh.topology.findHoleRepresentiveEdges())} (watertight by construction)")
 
-    # Clip to the exact domain box via meshlib's robust boolean intersect. Stays
-    # watertight (0 holes) with clean vertical CFD walls -- no fill_holes /
-    # keep-largest / debris juggling, and ~4x faster than a trimesh slice_plane
-    # clip (3.5s vs 14s). The box spans the full mesh z-range so only the XY walls
-    # cut; drops the terrain margin and any floating remesh debris in one step.
+def _finish_one(mesh_v, mesh_f, clip_polygon, out_stl, log, *,
+                expect_disconnected=False):
+    """Clip -> debris drop -> polish -> shipped-format verify -> optional strip-base
+    -> export. Returns the output path.
+
+    Takes NUMPY ARRAYS, not a meshlib Mesh, and rebuilds the mesh internally. That is
+    deliberate and load-bearing for the per-direction wind loop: mr.boolean,
+    deleteFaces, pack and resolveMeshDegenerations all mutate IN PLACE, so handing the
+    same Mesh object to successive directions would corrupt direction 2 onward. Each
+    call owns its geometry. Do not "optimise" this into reuse.
+    """
+    import meshlib.mrmeshpy as mr
+    import meshlib.mrmeshnumpy as mn
+    mesh = mn.meshFromFacesVerts(np.ascontiguousarray(mesh_f, np.int32),
+                                 np.ascontiguousarray(mesh_v, float))
+    # local aliases so the body below is unchanged from when it lived inline
+    domain_polygon = clip_polygon
     log(f"[clip] meshlib boolean intersect with exact domain polygon...")
     bb = mesh.computeBoundingBox()
     # Nudge the clip polygon OFF the voxel grid before cutting. The remesh puts
@@ -324,13 +354,21 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     # connected components), NOT on the reloaded STL soup below (whose components
     # are welding artifacts). Deleting a whole disconnected component opens no
     # boundary in the rest, so watertightness is preserved.
+    # ...UNLESS there is no terrain. `expect_disconnected` is include_base=False, where
+    # EVERY building is legitimately its own component because there is no slab to plunge
+    # into -- so the "connected by construction" premise above is simply false and the
+    # size rule deletes the whole domain except its single largest building. (Measured:
+    # exactly that, one building out no matter the domain size.) There, only drop what
+    # provably cannot be a closed volume: fewer than 4 faces, since the minimum closed
+    # solid is a tetrahedron.
     comps = mr.MeshComponents.getAllComponents(mr.MeshPart(clipped))
+    _max_debris = 3 if expect_disconnected else DEBRIS_MAX_FACES
     if len(comps) > 1:
         largest = max(comps, key=lambda cc: cc.count())
         drop = mr.FaceBitSet()
         ndrop = 0
         for comp in comps:
-            if comp is largest or comp.count() > DEBRIS_MAX_FACES:
+            if comp is largest or comp.count() > _max_debris:
                 continue
             # The terrain slab is part of this mesh and every building plunges
             # PLUNGE_M into it, so a real building is connected to the main body BY
@@ -549,49 +587,364 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     else:
         log(f"[verify] shipped STL reloads closed (holes=0)")
 
-    # include_base=False: strip the ground/terrain plane from the EXPORTED file
-    # only -- terrain stayed in the Blender join/voxel-remesh above the whole
-    # time, since an A/B test (fuse the same domain with vs. without terrain in
-    # the join, MD1's known-disintegrating span) showed terrain backing makes a
-    # large, real difference for ordinary ground-level buildings (solid grounded
-    # mass vs. a shattered wireframe lattice) even though it does nothing for a
-    # genuinely elevated thin span either way. So this is a late, separate
-    # boolean subtraction of the terrain solid already computed earlier in this
-    # function (kept in memory as `_terr_v_keep`/`_terr_f_keep` specifically for
-    # this -- reloading the exported terrain.ply back from disk was tried first
-    # and came back with real defects the in-memory mesh never had, see above)
-    # -- matches a normal CFD obstacle-only export (buildings as separate
-    # solids, no ground plate), not a different/riskier path through the remesh.
-    if not include_base:
-        log("[strip-base] subtracting terrain solid from the final export...")
-        import meshlib.mrmeshnumpy as mn
-        # The terrain solid's own outer wall is EXACTLY the domain-boundary
-        # clip wall the building mesh was already cut to (_polygon_clip_solid
-        # uses the same domain_polygon) -- an exact coincident/coplanar shared
-        # surface is a degenerate case for exact-CSG intersection ("contours
-        # ... are not closed or consistent"). A VDB offsetMesh was tried first
-        # to inflate the subtractor -- WAY too slow/hung at domain scale (voxel
-        # size has to be finer than the offset itself, e.g. 0.05m over a
-        # ~250m-wide mesh is millions of voxels). Fixed cheaply instead: scale
-        # the whole terrain solid by a tiny factor (1.0005, ~0.05% -- well under
-        # a centimeter at these building heights) about its own centroid, just
-        # enough that its wall/cap no longer exactly coincides with mesh A's
-        # own boundary anywhere, with no meaningful shift to the real cut shape.
-        centroid = _terr_v_keep.mean(axis=0)
-        scaled_v = centroid + (_terr_v_keep - centroid) * 1.0005
-        terrain_solid = mn.meshFromFacesVerts(_terr_f_keep, scaled_v)
-        res = mr.boolean(polished if n0 else clipped, terrain_solid, mr.BooleanOperation.DifferenceAB)
-        if not res.valid():
-            raise RuntimeError(f"meshlib boolean subtract (strip-base) failed: {res.errorString}")
-        stripped = res.mesh
-        mr.saveMesh(stripped, str(out_stl))
-        holes = len(stripped.topology.findHoleRepresentiveEdges())
-        log(f"[strip-base] watertight={holes == 0} (meshlib holes={holes}), "
-            f"{stripped.topology.numValidFaces()} faces")
-
-    log(f"[done] {out_stl}  (strictly watertight -- verify with meshlib holes/"
-        f"hasMultipleEdges, or a trimesh process=False + merge_vertices load)")
     return out_stl
+
+
+def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
+                     target_reduction=0.97, decimate_error=2.5, workers=6,
+                     store_dir=None, workdir=None, log=None, include_base=True,
+                     fuse_backend="meshlib", core_polygon=None, wind=None,
+                     placement="drape", coupling_lambda=None, check_contours=False,
+                     crossing="auto"):
+    """Run the full tile-native pipeline for one domain polygon (EPSG:3414).
+
+    `core_polygon` is the region of interest -- the polygon that decides which BUILDINGS
+    are kept. `domain_polygon` is the terrain extent and the mesh clip. They are the same
+    object unless a wind buffer was built, in which case domain_polygon is the (larger)
+    build envelope and core_polygon is the ROI the user actually drew.
+
+    `wind` (optional) turns this into a build-once/rotate-and-clip-per-direction run:
+    every heavy stage runs ONCE and each extra bearing costs only a rotate + clip +
+    polish. Returns a list of per-direction dicts instead of a single path.
+    """
+    import time
+    _sink = log
+    _t = [time.perf_counter()]
+
+    def log(msg):  # flushing + per-phase timing wrapper
+        now = time.perf_counter()
+        line = f"{msg}  (+{now - _t[0]:.1f}s)"
+        _t[0] = now
+        if _sink is None:
+            print(line, flush=True)
+        else:
+            _sink(line)
+
+    workdir = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="onemap_native_"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    core_polygon = domain_polygon if core_polygon is None else core_polygon
+
+    # What happens to a building straddling the ROI edge. "auto" is the only setting
+    # that is right in both worlds, so it is the default:
+    #
+    #   no buffer  -> the ROI *is* the clip line, so a straddler gets sliced flat.
+    #                 Drop it (Deliverable 3 semantics, matches the preview's "kept").
+    #   buffer on  -> the clip is at the wind rectangle, hundreds of metres out, so
+    #                 nothing slices it. Keep it whole, or the ROI perimeter ends up a
+    #                 ring of bare ground exactly where the roughness transition is.
+    #
+    # Explicit "drop"/"keep" override it. Note `core_polygon is domain_polygon` is an
+    # identity test on purpose -- they are the SAME object when no buffer was built.
+    crossing = crossing or "auto"          # None == "not specified"
+    if crossing not in ("auto", "drop", "keep"):
+        raise ValueError(f"crossing must be auto|drop|keep, got {crossing!r}")
+    buffered = core_polygon is not domain_polygon
+    require_full = (not buffered) if crossing == "auto" else (crossing == "drop")
+
+    # Recorded verbatim into every sidecar. These are exactly the knobs that change the
+    # output geometry, so a mesh can be reproduced from its sidecar alone.
+    _opts = dict(step=step, voxel_size=voxel_size, target_reduction=target_reduction,
+                 decimate_error=decimate_error, include_base=include_base,
+                 fuse_backend=fuse_backend, placement=placement,
+                 coupling_lambda=coupling_lambda, crossing=crossing,
+                 crossing_effective="drop" if require_full else "keep")
+
+    xmin, ymin, xmax, ymax = domain_polygon.bounds
+    cxmin, cymin, cxmax, cymax = core_polygon.bounds
+    lons, lats = _svy_to_wgs.transform([cxmin, cxmax], [cymin, cymax])
+    log(f"[tiles] walking tileset for the core ROI...")
+    leaves = domain_leaf_tiles(min(lons), min(lats), max(lons), max(lats))
+    log(f"[tiles] {len(leaves)} leaf tiles cover the core ROI")
+
+    log(f"[extract] crossing buildings: {'DROPPED' if require_full else 'KEPT WHOLE'} "
+        f"(--crossing {crossing}"
+        + (f" -> {'drop' if require_full else 'keep'}, buffer "
+           f"{'on' if buffered else 'off'})" if crossing == "auto" else ")"))
+
+    src = "precomputed store" if store_dir else f"{workers} live workers"
+    log(f"[extract] whole-mesh extraction ({src}, correct transform, clip)...")
+    _t_ext = [time.perf_counter()]
+    _last_pct = [-1]
+
+    def _prog(done, total):
+        filled = int(28 * done / total)
+        bar = "\u2588" * filled + "\u2591" * (28 - filled)
+        rate = done / max(time.perf_counter() - _t_ext[0], 1e-6)
+        eta = (total - done) / rate if rate else 0
+        end = "\n" if done == total else "\r"
+        print(f"    [{bar}] {done}/{total} tiles ({100*done//total}%)  ~{eta:4.0f}s left ",
+              end=end, flush=True)
+        # Also into the JOB log, or extraction is a long silent stretch in the UI.
+        pct = 100 * done // total
+        if _sink is not None and (pct // 10 > _last_pct[0] // 10 or done == total):
+            _last_pct[0] = pct
+            _sink(f"[extract] {done}/{total} tiles ({pct}%)"
+                  + (f"  ~{eta:.0f}s left" if done < total else ""))
+
+    pieces = extract_domain_buildings(leaves, core_polygon, workers=workers,
+                                      progress=_prog, store_dir=store_dir,
+                                      require_full=require_full)
+    log(f"[extract] {len(pieces)} building pieces")
+
+    # Exact tallest-building height, straight off the extracted geometry. This is what
+    # "5H/15H/5H from the tallest building actually extracted" means, and it costs
+    # nothing -- the pieces are already in hand. The UI's pre-submit estimate comes from
+    # onemap_buildings.jsonl instead (the footprint index is 72.8% zero-height and
+    # cannot be used for this).
+    if pieces:
+        h_exact = max(float(np.asarray(p["verts"])[:, 2].max()) - float(p["base_z"])
+                      for p in pieces)
+        log(f"[extract] tallest extracted building: {h_exact:.1f} m")
+    else:
+        h_exact = 0.0
+        log(f"[extract] no buildings in the core ROI")
+
+    log(f"[terrain] building DTM + conforming terrain (footprint-constrained)...")
+    grid_z, affine = build_domain_dtm((xmin, ymin, xmax, ymax), step=step)
+    dtm = DtmSampler(grid_z, affine)
+
+    # A LOUD FAILURE THAT WENT QUIET, RESTORED.
+    #
+    # v1 built the DTM per-domain from contour_points.npz via griddata, so a domain with
+    # zero 20 m-contour crossings had nothing to interpolate and raised. v2 crops the
+    # pre-built whole-island data/dtm.tif instead (a 42x speedup), and that raster is
+    # filled EVERYWHERE by nearest-fill, so the same domain now silently returns a
+    # plausible-looking surface. The griddata path still exists but only as a fallback
+    # for a missing cache, i.e. effectively never.
+    #
+    # What relief actually tells you, measured rather than guessed:
+    #   relief ~ 0    -- the interpolator had NO local data and returned one constant
+    #                    (Jurong, 1.5 km box: 0 contour points even within a 400 m halo,
+    #                    DTM constant at 20.00 m, itself a contour VALUE).
+    #   relief > 0    -- may still be entirely extrapolated: over open water, with 0
+    #                    contour points, nearest-fill pulled from several DIFFERENT
+    #                    distant contours and produced 8 m of FAKE relief.
+    # So flatness is NOT a reliable tell for missing data, and --check-contours is the
+    # only real signal. On genuinely flat reclaimed land the two coincide, because a
+    # contour map draws no line where there is no elevation change.
+    #
+    # Source resolution: dtm.tif is 20 m native (Contour_250K, 1:250,000), so `step`
+    # only interpolates -- below ~60 m of domain span there is no local detail at all.
+    relief = float(np.nanmax(grid_z) - np.nanmin(grid_z)) if grid_z.size else 0.0
+    span = max(xmax - xmin, ymax - ymin)
+    if include_base and relief < 1.0:
+        log(f"[terrain] !! WARNING: DTM relief is {relief:.2f} m across {span:.0f} m. "
+            f"That is the interpolator returning a single constant, not measured "
+            f"ground -- there is no contour data here. Correct on flat reclaimed land; "
+            f"elsewhere it means the terrain is extrapolated. Use --check-contours.")
+    if include_base and span < 60.0:
+        log(f"[terrain] !! WARNING: domain spans {span:.0f} m against a 20 m native DTM, "
+            f"so the terrain is a single interpolated patch with no local detail.")
+    if check_contours:
+        try:
+            from sbg.topo.dtm import load_points
+            cx, _cy, _cz = load_points(bbox=(xmin, ymin, xmax, ymax))
+            log(f"[terrain] {len(cx):,} source contour points inside the domain"
+                + ("  -- NONE: this terrain is entirely extrapolated from outside the "
+                   "domain and is not measured ground." if len(cx) == 0 else ""))
+        except Exception as e:
+            log(f"[terrain] contour check unavailable ({e})")
+
+    # include_base=False is the FLAT-GROUND assumption: the solver supplies a flat floor
+    # (snappyHexMesh's background blockMesh, Fluent's enclosure), and the STL carries
+    # obstacles only. So every building must sit on a COMMON datum -- leaving them at
+    # their own terrain-following pad_z would ship N solids at N different elevations
+    # with no ground between them, which no flat solver floor can fit.
+    #
+    # Pieces arrive from OneMap already on a z=0 datum (confirmed base_z == 0.000 across
+    # 1,061 pieces in 5 areas), so a zero DTM places them exactly there with no shift.
+    # Skirts go too: a skirt exists ONLY to overlap the terrain slab, and with no terrain
+    # it is just a 30 m spike hanging under each building.
+    _flat = not include_base
+    # The datum is offset half a voxel, NOT left at 0. Landing every base exactly on a
+    # voxel grid plane is degenerate -- measured: 34 fragments instead of 12, which the
+    # debris filter then silently DELETES. Same class as SBG_CLIP_NUDGE_M. The offset is
+    # subtracted back out after the fuse, so the shipped file still has its base at 0.
+    _flat_datum = 0.5 * voxel_size if (_flat and voxel_size and voxel_size > 0) else 0.0
+    bld_v, bld_f, terr_v, terr_f = place_on_terrain_conforming(
+        pieces,
+        DtmSampler(np.full_like(grid_z, _flat_datum), affine) if _flat else dtm,
+        domain_polygon, skirt=voxel_size > 0 and not _flat,
+        mode=placement, coupling_lambda=coupling_lambda)
+    _lam = ("" if placement != "laplacian"
+            else f" lambda={coupling_lambda if coupling_lambda is not None else COUPLING_LAMBDA:g}")
+    if _flat:
+        log(f"[terrain] FLAT-GROUND mode: {len(pieces)} buildings on a common z=0 datum, "
+            f"no terrain, no skirts (the solver supplies the floor)")
+        if relief > 5.0:
+            log(f"[terrain] note: this domain has {relief:.0f} m of real relief, which a "
+                f"flat datum discards. Fine if that is what you want.")
+        terr_v, terr_f = terr_v[:0], terr_f[:0]
+    else:
+        log(f"[terrain] DTM {grid_z.shape} elev {np.nanmin(grid_z):.0f}-{np.nanmax(grid_z):.0f}m, "
+            f"{len(pieces)} pieces placed, {len(terr_f):,} terrain triangles "
+            f"(placement={placement}{_lam})")
+
+        # Extrude the terrain surface down to a FLAT plane (not a fixed-thickness slab --
+        # a hilltop gets a tall column, low ground a short one, "to scale"). Replaces
+        # Blender's SOLIDIFY for terrain entirely. base_z is NOT hardcoded 0: a plunge
+        # skirt can reach PLUNGE_M below its own pad_z, and on low ground that goes
+        # negative (measured -10 m on a real domain), which left skirts poking through
+        # the solid's own sealed bottom cap -- a real, visible hole.
+        base_z = min(0.0, float(bld_v[:, 2].min()) - 1.0) if len(bld_v) else 0.0
+        terr_v, terr_f = terrain_flat_base_solid(terr_v, terr_f, domain_polygon,
+                                                 base_z=base_z)
+        log(f"[terrain] flat-base solid: z {base_z:.0f}-{terr_v[:, 2].max():.0f}m, "
+            f"{len(terr_f):,} faces")
+
+    # High-fidelity raw mode (voxel_size <= 0): skip the whole watertight machinery and
+    # dump the real OneMap meshes straight to STL. Preserves full LiDAR detail and is
+    # fast, but is a non-watertight triangle soup -- ACCEPTED by Ansys fault-tolerant
+    # meshing (already the production path there) and by snappyHexMesh, which meshed it
+    # at 1,030,259 cells with no errors; rejected only by the Ansys *watertight* workflow.
+    if voxel_size is not None and voxel_size <= 0:
+        import trimesh
+        if include_base:
+            verts = np.vstack([terr_v, bld_v])
+            faces = np.vstack([terr_f, bld_f + len(terr_v)])
+        else:
+            verts, faces = bld_v, bld_f
+
+        if wind:
+            # RAW mode performs NO clip, so each output's extent is the build envelope,
+            # not the wind rectangle, and "inlet = ymin" is not a claim about its walls.
+            # The sidecar says so via clipped=False. Do NOT try to clip the raw soup:
+            # boolean on un-fused soup is exactly the failure this pipeline avoids.
+            from sbg.onemap_native.wind import flow_bearing_deg, rotate_xy, wind_rect
+            centre = np.asarray(wind["centre"], dtype=float)[:2]
+            out_dir = Path(out_stl).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            outs = []
+            for i, wf in enumerate(wind["dirs"], 1):
+                psi = flow_bearing_deg(wf)
+                log(f"[direction] {i}/{len(wind['dirs'])} wind from {wf:g} deg (raw)")
+                p = out_dir / f"wind_{int(round(wf)) % 360:03d}.stl"
+                trimesh.Trimesh(rotate_xy(verts, psi, centre), faces,
+                                process=False).export(str(p))
+                rect_rot, _ = wind_rect(core_polygon, centre, psi,
+                                        wind["up_m"], wind["down_m"], wind["lat_m"])
+                outs.append(_write_wind_sidecar(p, wf, psi, centre, core_polygon,
+                                                rect_rot, wind, h_exact, log,
+                                                clipped=False, store_dir=store_dir,
+                                                opts=_opts))
+            log(f"[done] {len(outs)} raw direction(s) in {out_dir}  "
+                f"(UNCLIPPED soup -- extent is the build envelope, not the wind rect)")
+            return outs
+
+        trimesh.Trimesh(verts, faces, process=False).export(str(out_stl))
+        log(f"[raw] high-fidelity NON-watertight mesh: {len(faces):,} faces "
+            f"({'with' if include_base else 'without'} ground plane; "
+            f"skipped fuse/decimate/clip/polish)")
+        log(f"[done] {out_stl}  (raw high-fidelity soup -- not watertight by design)")
+        _write_build_sidecar(out_stl, domain_polygon, core_polygon, h_exact, log,
+                             store_dir=store_dir, opts=_opts)
+        return out_stl
+
+    import meshlib.mrmeshpy as mr
+
+    if fuse_backend == "meshlib":
+        # No subprocess, no PLY round-trip, no Blender install. Same OpenVDB
+        # algorithm Blender's REMESH modifier uses -- see _fuse_meshlib.
+        mesh = _fuse_meshlib(terr_v, terr_f, bld_v, bld_f, voxel_size, log)
+        del terr_v, terr_f, bld_v, bld_f, pieces
+        import gc
+        gc.collect()
+    else:
+        terr_ply = workdir / "terrain.ply"
+        bld_ply = workdir / "buildings.ply"
+        _write_scene_ply(terr_ply, bld_ply, terr_v, terr_f, bld_v, bld_f)
+        log(f"[scene] wrote terrain+buildings PLY "
+            f"({(terr_ply.stat().st_size + bld_ply.stat().st_size) / 1e6:.0f} MB)")
+        # free the big geometry arrays before spawning Blender -- keeps this
+        # process's RSS low while Blender does its memory-heavy remesh.
+        del terr_v, terr_f, bld_v, bld_f, pieces
+        import gc
+        gc.collect()
+
+        # Fuse to PLY (welded/indexed) not STL (per-triangle soup). The voxel-remesh
+        # output is perfectly watertight; STL un-welds it and re-welding in trimesh
+        # manufactures hundreds of SPURIOUS non-manifold edges. PLY carries Blender's
+        # clean welding straight through.
+        raw_ply = workdir / "fused.ply"
+        log(f"[blender] fusing (join + voxel remesh {voxel_size}m -> watertight PLY)...")
+        subprocess.run(
+            [str(BLENDER_PATH), "--background", "--python", str(_FUSE_SCRIPT), "--",
+             "--terrain", str(terr_ply), "--buildings", str(bld_ply), "--output", str(raw_ply),
+             "--voxel-size", str(voxel_size), "--skip-terrain-solidify",
+             "--skip-debris"],  # clip's keep-largest handles debris; skip the ~30s Blender split
+            check=True,
+        )
+        log(f"[blender] fuse done")
+        mesh = mr.loadMesh(str(raw_ply))
+
+    # meshlib manifold-preserving decimation -- replaces fast_simplification +
+    # pymeshfix ENTIRELY. meshlib's half-edge topology literally cannot represent
+    # a non-manifold edge, so decimation stays watertight BY CONSTRUCTION (FQMS/
+    # meshopt broke it -> 351 non-manifold + 613 holes -> forced a slow ~45s
+    # pymeshfix global rebuild). Same face count, watertight, no repair needed.
+    log(f"[decimate] meshlib manifold-preserving decimation (stays watertight, no pymeshfix)...")
+    nf0 = mesh.topology.numValidFaces()
+    ds = mr.DecimateSettings()
+    ds.maxDeletedFaces = int(nf0 * target_reduction)
+    ds.maxError = decimate_error
+    mr.decimateMesh(mesh, ds)
+    log(f"[decimate] {nf0} -> {mesh.topology.numValidFaces()} faces, "
+        f"holes={len(mesh.topology.findHoleRepresentiveEdges())} (watertight by construction)")
+
+    # Clip to the exact domain box via meshlib's robust boolean intersect. Stays
+    # watertight (0 holes) with clean vertical CFD walls -- no fill_holes /
+    # keep-largest / debris juggling, and ~4x faster than a trimesh slice_plane
+    # clip (3.5s vs 14s). The box spans the full mesh z-range so only the XY walls
+    # cut; drops the terrain margin and any floating remesh debris in one step.
+    import meshlib.mrmeshnumpy as _mn_out
+    _V = _mn_out.getNumpyVerts(mesh)
+    if _flat_datum:
+        _V = _V.copy()
+        _V[:, 2] -= _flat_datum      # shift the base back to 0; see _flat_datum above
+    _F = _mn_out.getNumpyFaces(mesh.topology)
+    del mesh
+
+    if not wind:
+        p = _finish_one(_V, _F, domain_polygon, out_stl, log,
+                        expect_disconnected=_flat)
+        _write_build_sidecar(p, domain_polygon, core_polygon, h_exact, log,
+                             store_dir=store_dir, opts=_opts)
+        return p
+
+    # ---- BUILD ONCE, ROTATE + CLIP PER DIRECTION -----------------------------------
+    # Everything above ran exactly once and is direction-agnostic. Only the clip depends
+    # on the wind, so each extra direction costs a rotate + clip + polish (~2 s) instead
+    # of a whole build. Measured 7.0x less total work than N separate domains at N=16.
+    from sbg.onemap_native.wind import flow_bearing_deg, rotate_xy, wind_rect
+
+    dirs = list(wind["dirs"])
+    centre = np.asarray(wind["centre"], dtype=float)[:2]
+    up_m, down_m, lat_m = wind["up_m"], wind["down_m"], wind["lat_m"]
+    core = core_polygon
+    out_dir = Path(out_stl).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs = []
+    for i, wf in enumerate(dirs, 1):
+        psi = flow_bearing_deg(wf)
+        log(f"[direction] {i}/{len(dirs)} wind from {wf:g} deg (psi {psi:g})")
+
+        # Rotate BEFORE clipping, not after. The polish's whole job is float32-exactness
+        # at the shipped precision; rotating a polished mesh re-perturbs every vertex and
+        # invalidates the check that was just performed. Rotating first also makes the
+        # clip solid an exactly axis-aligned box rather than an extruded rotated quad.
+        Vr = rotate_xy(_V, psi, centre)
+        rect_rot, _ = wind_rect(core, centre, psi, up_m, down_m, lat_m)
+
+        p = out_dir / f"wind_{int(round(wf)) % 360:03d}.stl"
+        _finish_one(Vr, _F, rect_rot, p, log, expect_disconnected=_flat)
+        outputs.append(_write_wind_sidecar(p, wf, psi, centre, core, rect_rot,
+                                           wind, h_exact, log, store_dir=store_dir,
+                                           opts=_opts))
+
+    log(f"[done] {len(outputs)} direction(s) written to {out_dir}")
+    return outputs
 
 
 def main():
@@ -619,6 +972,29 @@ def main():
                     help="precomputed placed-building store (see sbg.onemap_native.precompute); "
                          "when set, cutout loads from it instead of fetching/decoding tiles")
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--wind-from", default=None,
+                    help="METEOROLOGICAL bearings the wind blows FROM, clockwise from "
+                         "north: a comma list ('0,45,90'), or 'rose4'/'rose8'/'rose16'. "
+                         "Turns on the wind-aligned CFD domain: geometry is emitted "
+                         "already rotated so the flow is always +Y, which means the Fluent "
+                         "setup never changes (inlet always ymin, outlet always ymax) and "
+                         "45 degrees is as easy as 0. Writes wind_<bearing>.stl plus a "
+                         "wind_<bearing>.wind.json sidecar per direction into -o's parent "
+                         "directory. Everything heavy runs ONCE; each extra direction is "
+                         "just a rotate + clip.")
+    ap.add_argument("--buffer-h", type=float, default=None,
+                    help="--wind-from only. Building height H (m) to size the CFD buffer "
+                         "from, per COST 732: 5H upwind / 15H downwind / 5H lateral. "
+                         "Default: the tallest building actually extracted from the ROI. "
+                         "Auto sizing is capped at 60 m -- use --buffer-m above that.")
+    ap.add_argument("--buffer-m", default=None,
+                    help="--wind-from only. Explicit buffer as 'up,down,lateral' in metres, "
+                         "overriding --buffer-h and every cap.")
+    ap.add_argument("--z0", type=float, default=0.7,
+                    help="--wind-from only. Advisory ground roughness length (m) recorded "
+                         "in the sidecar. The buffer is bare terrain with no buildings, so "
+                         "upstream roughness must be supplied as a Fluent wall BC -- the "
+                         "mesh does NOT encode it.")
     ap.add_argument("--fuse-backend", choices=("meshlib", "blender"), default="meshlib",
                     help="voxel-remesh backend. Both call OpenVDB; the FUSE STEP is "
                          "equivalent (1,300,768 faces either way, volume differing by 1 m3 "
@@ -638,6 +1014,18 @@ def main():
                          "drape=no grouping at all (hillside strings terrace, "
                          "bridges shear); laplacian=soft coupling, both resolve "
                          "without classification (see --coupling-lambda)")
+    ap.add_argument("--crossing", choices=("auto", "drop", "keep"), default="auto",
+                    help="buildings straddling the area-of-interest edge. auto (default) "
+                         "drops them when there is no buffer (they would be sliced flat by "
+                         "the clip) and keeps them whole when a wind buffer exists (the "
+                         "clip is hundreds of metres away, so nothing slices them). "
+                         "drop/keep force it.")
+    ap.add_argument("--check-contours", action="store_true",
+                    help="count the source contour points inside the domain and report "
+                         "them. The DTM cache is filled everywhere by nearest-fill, so a "
+                         "domain with no real contour data still returns a plausible "
+                         "surface; this is the only way to see that. Reads a 285 MB npz, "
+                         "hence opt-in.")
     ap.add_argument("--coupling-lambda", type=float, default=None,
                     help=f"--placement laplacian only (default {COUPLING_LAMBDA:g}). "
                          "Higher = flatter/more grouped, lower = more terracing; "
@@ -652,12 +1040,55 @@ def main():
 
     domain = load_domain_polygon(bbox=args.bbox, domain_geojson=args.domain_geojson,
                                  domain_crs=args.domain_crs)
+
+    core, wind = domain, None
+    if args.wind_from:
+        from sbg.onemap_native.wind import (
+            build_envelope, buffer_distances, check_envelope, normalise_dirs,
+            roi_centre, rose)
+        spec = args.wind_from.strip().lower()
+        dirs = (rose(int(spec[4:])) if spec.startswith("rose")
+                else normalise_dirs(spec.split(",")))
+
+        override = None
+        if args.buffer_m:
+            u, d, l = (float(v) for v in args.buffer_m.split(","))
+            override = {"upwind": u, "downwind": d, "lateral": l}
+            h = float("nan")
+        elif args.buffer_h is not None:
+            h = args.buffer_h
+        else:
+            # Estimate H from SLA's own batch-table heights. The footprint index cannot
+            # be used for this -- 72.8% of its heights are zero (see heights.py). The
+            # EXACT H is logged during extraction for cross-checking.
+            from sbg.onemap_native.heights import roi_height_stats
+            st = roi_height_stats(core)
+            h = st["max"]
+            print(f"[wind] {st['count']} buildings in the ROI: max {st['max']:.1f} m, "
+                  f"p90 {st['p90']:.1f} m, median {st['median']:.1f} m")
+            print(f"[wind] sizing from max; --buffer-h {st['p90']:.0f} would use p90 "
+                  f"and give a much smaller domain")
+
+        up, down, lat, warns = buffer_distances(h, override_m=override)
+        for w in warns:
+            print(f"[wind] warning: {w}")
+
+        c = roi_centre(core)
+        domain = build_envelope(core, c, dirs, up, down, lat)
+        check_envelope(domain, core, c, dirs, up, down, lat)
+        print(f"[wind] {len(dirs)} direction(s); buffer {up:.0f}/{down:.0f}/{lat:.0f} m; "
+              f"ROI {core.area/1e6:.2f} km^2 -> build envelope {domain.area/1e6:.2f} km^2")
+        wind = {"dirs": dirs, "centre": c, "up_m": up, "down_m": down,
+                "lat_m": lat, "z0_m": args.z0}
+
     build_domain_stl(domain, args.output, step=args.step, voxel_size=args.voxel_size,
                      target_reduction=args.target_reduction, decimate_error=args.decimate_error,
                      workers=args.workers, store_dir=args.store, workdir=args.workdir,
-                     fuse_backend=args.fuse_backend,
+                     fuse_backend=args.fuse_backend, core_polygon=core, wind=wind,
                      include_base=not args.no_base, placement=args.placement,
-                     coupling_lambda=args.coupling_lambda)
+                     coupling_lambda=args.coupling_lambda,
+                     check_contours=args.check_contours,
+                     crossing=args.crossing)
 
 
 if __name__ == "__main__":
