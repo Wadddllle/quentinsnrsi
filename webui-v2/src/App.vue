@@ -3,6 +3,7 @@ import { ref, shallowRef, computed, watch, onMounted, nextTick } from 'vue';
 import OrthoWebGLView from './components/OrthoWebGLView.vue';
 import LocationSearchBox from './components/LocationSearchBox.vue';
 import StlViewer from './components/StlViewer.vue';
+import DemViewer from './components/DemViewer.vue';
 import WindRosePicker from './components/WindRosePicker.vue';
 
 // --- state ---
@@ -17,11 +18,11 @@ const keptIds = ref([]);
 const crossingIds = ref([]);
 const stats = ref(null);                // {kept_count, crossing_count, area_km2, bounds}
 const borderMode = ref('polygon');      // 'polygon' | 'rect' | 'buffer'
-const bboxText = ref('');               // typed domain, same format as the CLI's --bbox
+const domainText = ref('');             // typed domain; format follows borderMode
 const bufferRadius = ref(750);          // meters, for point+buffer
 let rectCorner = null;                  // first corner while drawing a rectangle
 
-const view = ref('map');                // 'map' | 'result'
+const view = ref('map');                // 'map' | 'result' | 'dem'
 const job = ref(null);                  // job status dict
 const jobId = ref(null);
 let pollTimer = null;
@@ -109,7 +110,7 @@ const overlays = computed(() => {
 });
 
 // --- power-user build options (whitelisted server-side in _BUILD_OPTS) ---
-const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0, crossing: 'auto' };
+const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0, crossing: 'auto', include_raw: false, dem: false, dem_px_m: 4.0, dem_crs: 3414, dem_agg: 'median', dem_overhang: 'keep', dem_supersample: 4, dem_source: 'surface', dem_only: false };
 const options = ref({ ...DEFAULT_OPTS });
 const showAdvanced = ref(false);
 // Long-form explanation belongs behind an (i), not printed in the sidebar. This is a
@@ -122,7 +123,17 @@ const rawMode = computed(() => Number(options.value.voxel_size) <= 0);
 // reset a deliberately-chosen value to the default.
 let lastCellSize = DEFAULT_OPTS.voxel_size;
 watch(() => options.value.voxel_size, (v) => { if (Number(v) > 0) lastCellSize = Number(v); });
-function setWatertight() { options.value.voxel_size = lastCellSize || DEFAULT_OPTS.voxel_size; }
+function setWatertight() {
+  options.value.dem_only = false;
+  options.value.voxel_size = lastCellSize || DEFAULT_OPTS.voxel_size;
+}
+function setRaw() { options.value.dem_only = false; options.value.voxel_size = 0; }
+function setDemOnly() {
+  options.value.dem_only = true;
+  options.value.dem = true;              // asking for the GeoTIFF alone implies it
+  options.value.voxel_size = lastCellSize || DEFAULT_OPTS.voxel_size;
+}
+const demOnly = computed(() => !!options.value.dem_only);
 function resetOptions() { options.value = { ...DEFAULT_OPTS }; }
 
 // Cancel is COOPERATIVE: the pipeline stops at its next stage boundary, because the
@@ -161,38 +172,85 @@ onMounted(async () => {
 // --- typed domain entry ---------------------------------------------------------
 // Parsed leniently (commas or whitespace) but validated strictly: a domain that is
 // silently mis-parsed is worse than one that is refused.
-function parseBbox(t) {
-  const n = String(t).trim().split(/[\s,]+/).filter(Boolean).map(Number);
-  if (n.length !== 4 || n.some((v) => !Number.isFinite(v))) return null;
-  const [x0, y0, x1, y1] = n;
-  if (x0 === x1 || y0 === y1) return null;
-  return [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+// The FORMAT FOLLOWS THE MODE, so there is nothing to auto-detect -- three numbers are
+// unambiguously x,y,radius in buffer mode and simply invalid in rectangle mode. Guessing
+// from the count alone would silently build the wrong domain, which is the one outcome
+// worth refusing outright.
+const ENTRY_SPEC = {
+  rect:    { placeholder: 'xmin,ymin,xmax,ymax', hint: 'four numbers: xmin,ymin,xmax,ymax (same as the CLI --bbox)' },
+  buffer:  { placeholder: 'x,y,radius',          hint: 'three numbers: centre x, centre y, half-width in metres' },
+  polygon: { placeholder: 'x1,y1 x2,y2 x3,y3 …', hint: 'at least three x,y pairs, separated by spaces, commas or newlines' },
+};
+const entrySpec = computed(() => ENTRY_SPEC[borderMode.value]);
+
+function nums(t) {
+  return String(t).trim().split(/[\s,]+/).filter(Boolean).map(Number);
 }
 
-const bboxValid = computed(() => parseBbox(bboxText.value) !== null);
+// Returns {ring, radius?} or null. Lenient about separators, strict about everything
+// else: a domain that is silently mis-parsed is worse than one that is refused.
+function parseDomain(t, mode) {
+  const n = nums(t);
+  if (!n.length || n.some((v) => !Number.isFinite(v))) return null;
+  if (mode === 'rect') {
+    if (n.length !== 4) return null;
+    const [x0, y0, x1, y1] = n;
+    if (x0 === x1 || y0 === y1) return null;
+    const [ax, ay, bx, by] = [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+    return { ring: [[ax, ay], [bx, ay], [bx, by], [ax, by]] };
+  }
+  if (mode === 'buffer') {
+    if (n.length !== 3) return null;
+    const [cx, cy, r] = n;
+    if (!(r >= 50)) return null;
+    return { ring: [[cx - r, cy - r], [cx + r, cy - r], [cx + r, cy + r], [cx - r, cy + r]], radius: r };
+  }
+  if (n.length < 6 || n.length % 2) return null;
+  const pts = [];
+  for (let i = 0; i < n.length; i += 2) pts.push([n[i], n[i + 1]]);
+  // Drop a repeated closing vertex -- shapely writes one, our ring convention does not.
+  const [f, l] = [pts[0], pts[pts.length - 1]];
+  if (pts.length > 3 && f[0] === l[0] && f[1] === l[1]) pts.pop();
+  return pts.length >= 3 ? { ring: pts } : null;
+}
 
-// The ring is the single source of truth for the ROI, so a typed bbox just writes one
+const entryParsed = computed(() => parseDomain(domainText.value, borderMode.value));
+const entryValid = computed(() => entryParsed.value !== null);
+
+// The ring is the single source of truth for the ROI, so typed entry just writes one
 // -- no new backend path, and every downstream consumer (preview, wind plan, generate)
 // is unchanged.
-function applyBbox() {
-  const b = parseBbox(bboxText.value);
-  if (!b) return;
-  const [x0, y0, x1, y1] = b;
-  ring.value = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+function applyDomain() {
+  const p = entryParsed.value;
+  if (!p) return;
+  ring.value = p.ring;
+  if (p.radius) bufferRadius.value = p.radius;
   rectCorner = null;
-  mapRef.value?.fitBounds?.(x0, y0, x1, y1);
+  const xs = p.ring.map((q) => q[0]), ys = p.ring.map((q) => q[1]);
+  mapRef.value?.fitBounds?.(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
 }
 
-// Read back the ROI's own bounds so a drawn domain can be written down. `bounds` comes
-// from /api/domain/preview, computed server-side from the same polygon that gets built.
-const roiBbox = computed(() => {
-  const b = stats.value?.bounds;
-  if (!b) return null;
-  return b.map((v) => Math.round(v * 10) / 10).join(',');
+// Read the ROI back out IN THE SAME FORMAT it is typed in, so a drawn domain can be
+// written down, pasted back, or handed to a colleague. Read straight off `ring` (the
+// clicked vertices) rather than the server's bbox -- for a polygon a bounding box is not
+// the domain, and echoing the points the user placed is not a geometry computation.
+const r1 = (v) => Math.round(v * 10) / 10;
+const domainSpec = computed(() => {
+  const r = ring.value;
+  if (r.length < 3) return null;
+  const xs = r.map((p) => p[0]), ys = r.map((p) => p[1]);
+  if (borderMode.value === 'rect') {
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)].map(r1).join(',');
+  }
+  if (borderMode.value === 'buffer' && r.length === 4) {
+    const [x0, x1, y0, y1] = [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+    return [r1((x0 + x1) / 2), r1((y0 + y1) / 2), r1((x1 - x0) / 2)].join(',');
+  }
+  return r.map((p) => `${r1(p[0])},${r1(p[1])}`).join(' ');
 });
 
-function copyBbox() {
-  if (roiBbox.value) navigator.clipboard?.writeText(roiBbox.value);
+function copyDomain() {
+  if (domainSpec.value) navigator.clipboard?.writeText(domainSpec.value);
 }
 
 function onGoto({ x, y }) {
@@ -219,7 +277,9 @@ function onMapClick([x, y]) {
     ring.value = [[x - r, y - r], [x + r, y - r], [x + r, y + r], [x - r, y + r]];
   }
 }
-function setBorderMode(m) { borderMode.value = m; clearBorder(); }
+// Clear the typed text too: it is in the OLD mode's format, so leaving it would show a
+// validation error against a string the user never got wrong.
+function setBorderMode(m) { borderMode.value = m; domainText.value = ''; clearBorder(); }
 function undoPoint() {
   if (borderMode.value === 'polygon') ring.value = ring.value.slice(0, -1);
   else clearBorder();
@@ -296,6 +356,11 @@ async function generate() {
   }
   // lambda is meaningless outside laplacian mode -- don't send it and imply it did something
   if (opts.placement !== 'laplacian') delete opts.coupling_lambda;
+  // same reasoning as coupling_lambda: don't ship knobs that did nothing, and don't let
+  // a stale sub-option imply the DEM was configured when it was never requested
+  if (!opts.dem) for (const k of ['dem_px_m', 'dem_crs', 'dem_agg', 'dem_overhang', 'dem_supersample', 'dem_source', 'dem_only']) delete opts[k];
+  // a heightmap-only run builds no mesh, so mesh knobs would be noise in the sidecar
+  if (opts.dem_only) for (const k of ['decimate_error', 'target_reduction', 'include_raw']) delete opts[k];
   jobWasRaw.value = rawMode.value;
   const body = { ring: ring.value, options: opts };
   const w = windPayload();
@@ -331,7 +396,9 @@ function pollJob() {
       // A single output has nothing to choose between, so show it. A wind run does:
       // jumping to 3D would display direction 0 only and scroll the N-direction table
       // out of sight, which is the actual deliverable.
-      if ((job.value.result?.outputs?.length || 1) > 1) {
+      if (job.value.result?.dem_only) {
+        view.value = 'dem';                 // the heightmap IS the deliverable here
+      } else if ((job.value.result?.outputs?.length || 1) > 1) {
         nextTick(() => resultBox.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
       } else {
         view.value = 'result';
@@ -347,6 +414,7 @@ const stageLabels = {
   tiles: 'Finding tiles', extract: 'Extracting buildings', terrain: 'Building terrain',
   write: 'Writing scene', fuse: 'Fusing (voxel remesh)', decimate: 'Decimating',
   clip: 'Clipping to domain', polish: 'Polishing (watertight)', raw: 'Exporting raw mesh',
+  dem: 'Sampling DEM',
   verify: 'Verifying', done: 'Done',
 };
 
@@ -355,6 +423,8 @@ const outputs = computed(() => result.value?.outputs || (result.value ? [result.
 const isMulti = computed(() => outputs.value.length > 1);
 const bundleUrl = computed(() => jobId.value ? `/api/stl/jobs/${jobId.value}/bundle` : null);
 function fileUrl(name) { return `/api/stl/jobs/${jobId.value}/files/${encodeURIComponent(name)}`; }
+const demPreviewUrl = computed(() =>
+  jobId.value && result.value?.dem_filename ? `/api/stl/jobs/${jobId.value}/dem_preview` : null);
 const viewerUrl = computed(() => {
   if (!outputs.value.length) return null;
   const o = outputs.value[Math.min(selectedOutput.value, outputs.value.length - 1)];
@@ -362,8 +432,11 @@ const viewerUrl = computed(() => {
 });
 function showOutput(i) { selectedOutput.value = i; view.value = 'result'; }
 const optSummary = computed(() =>
-  rawMode.value ? 'raw high-fidelity (not watertight)'
-    : `voxel ${options.value.voxel_size}m · error ${options.value.decimate_error}m`);
+  demOnly.value ? `heightmap · ${options.value.dem_px_m}m pixels`
+    : (rawMode.value ? 'raw high-fidelity (not watertight)'
+      : `voxel ${options.value.voxel_size}m · error ${options.value.decimate_error}m`
+        + (options.value.include_raw ? ' · + raw' : ''))
+      + (options.value.dem ? ` · + heightmap ${options.value.dem_px_m}m` : ''));
 // The server already tails to LOG_TAIL_LINES (400) and reports log_total, so slicing
 // again here just threw away 394 of them -- which is why the panel looked like it could
 // only hold ~6 lines and appeared to wipe itself on every 2 s poll.
@@ -384,12 +457,13 @@ watch(logTail, () => {
 <template>
   <div class="app">
     <header class="topbar">
-      <div class="brand">SBG · CFD Domain → STL</div>
+      <div class="brand">SBG · CFD Domain Builder</div>
       <LocationSearchBox @goto="onGoto" />
       <div class="spacer" />
       <div class="viewtoggle">
         <button :class="{ active: view === 'map' }" @click="view = 'map'">2D Map</button>
-        <button :class="{ active: view === 'result' }" :disabled="!result" @click="view = 'result'">3D STL</button>
+        <button :class="{ active: view === 'result' }" :disabled="!result || result.dem_only" @click="view = 'result'">3D model</button>
+        <button :class="{ active: view === 'dem' }" :disabled="!result?.dem_filename" @click="view = 'dem'">Heightmap</button>
       </div>
       <button @click="resetView" v-if="view === 'map'">Reset view</button>
     </header>
@@ -417,20 +491,23 @@ watch(logTail, () => {
 
           <!-- Typed domain entry. Clicking is fine for exploring, but a domain that
                cannot be written down cannot be reproduced, cited, or handed to a
-               colleague -- and the CLI has had --bbox all along. Accepts that exact
-               string so the two are interchangeable. -->
+               colleague. The format follows the mode above, and the readout uses that
+               same format, so a drawn domain round-trips back into this box. Rectangle
+               mode is byte-compatible with the CLI's --bbox. -->
           <div class="bboxrow">
-            <input v-model="bboxText" placeholder="xmin,ymin,xmax,ymax (EPSG:3414)"
-              @keyup.enter="applyBbox" />
-            <button @click="applyBbox" :disabled="!bboxValid">Set</button>
+            <textarea v-if="borderMode === 'polygon'" v-model="domainText" rows="2"
+              :placeholder="entrySpec.placeholder"></textarea>
+            <input v-else v-model="domainText" :placeholder="entrySpec.placeholder"
+              @keyup.enter="applyDomain" />
+            <button @click="applyDomain" :disabled="!entryValid">Set</button>
           </div>
           <p class="hint muted bboxhint">
-            <span v-if="bboxText && !bboxValid" class="warn">Need four numbers, xmin,ymin,xmax,ymax.</span>
-            <span v-else-if="roiBbox">
-              current: <code>{{ roiBbox }}</code>
-              <button class="link" @click="copyBbox">copy</button>
+            <span v-if="domainText && !entryValid" class="warn">Need {{ entrySpec.hint }}.</span>
+            <span v-else-if="domainSpec">
+              current: <code>{{ domainSpec }}</code>
+              <button class="link" @click="copyDomain">copy</button>
             </span>
-            <span v-else>Or type a domain directly — same format as the CLI's <code>--bbox</code>.</span>
+            <span v-else>Or type it directly (EPSG:3414) — {{ entrySpec.hint }}.</span>
           </p>
           <div class="row">
             <button @click="undoPoint" :disabled="!ring.length">Undo</button>
@@ -516,19 +593,24 @@ watch(logTail, () => {
         </section>
 
         <section>
-          <h3>3 · Generate STL</h3>
+          <h3>3 · Generate</h3>
           <!-- TWO modes, not three. The earlier "Watertight 2 m / Raw / Other" split was
                broken: Other was unreachable from Raw, and stepping the cell size up to 2
                silently flipped the active button back to Watertight, hiding the input
                mid-edit. Cell size is a PROPERTY of watertight mode, so it lives with it. -->
           <div class="modes">
-            <button :class="{ active: !rawMode }" @click="setWatertight">Watertight</button>
-            <button :class="{ active: rawMode }" @click="options.voxel_size = 0">Raw detail</button>
+            <button :class="{ active: !rawMode && !demOnly }" @click="setWatertight">Watertight</button>
+            <button :class="{ active: rawMode && !demOnly }" @click="setRaw">Raw detail</button>
+            <button :class="{ active: demOnly }" @click="setDemOnly">GeoTIFF</button>
           </div>
-          <label v-if="!rawMode" class="hint cellsize">Cell size (m)
+          <label v-if="!rawMode && !demOnly" class="hint cellsize">Cell size (m)
             <input type="number" step="0.5" min="0.5" v-model.number="options.voxel_size" />
             <button class="ibtn" @click.prevent="toggleInfo('voxel')" title="What this does">i</button>
           </label>
+          <p class="hint muted" v-else-if="demOnly">
+            Heightmap only — no 3D model is built.
+            <button class="ibtn" @click.prevent="toggleInfo('voxel')" title="What this does">i</button>
+          </p>
           <p class="hint muted" v-else>
             Exact captured geometry, not watertight.
             <button class="ibtn" @click.prevent="toggleInfo('voxel')" title="What this does">i</button>
@@ -541,12 +623,46 @@ watch(logTail, () => {
               fault-tolerant meshing and snappyHexMesh, rejected by Ansys watertight.</p>
             <p>Smaller voxels mean finer detail and more faces.</p>
           </div>
+          <!-- The dose workflow needs BOTH files of the same place. Getting them used to
+               mean running this twice with the mode flipped, and nothing checked that the
+               two runs used the same area, buffer and directions -- a mismatch that shows
+               up as a silently wrong dose map, never as an error. One run, both files. -->
+          <label v-if="!rawMode && !demOnly" class="hint toggle raw-also">
+            <input type="checkbox" v-model="options.include_raw" />
+            Also export raw detail
+            <button class="ibtn" @click.prevent="toggleInfo('alsoraw')" title="What this does">i</button>
+          </label>
+          <div class="pop" v-if="info === 'alsoraw'">
+            <p>Writes a second <code>.raw.stl</code> beside each watertight file — the
+              same area, same rotation, from the same run.</p>
+            <p>Use it when one place feeds both tools: <b>raw</b> into Ansys
+              fault-tolerant meshing for the CFD, <b>watertight</b> into OpenMC, which has
+              to trace rays through a closed solid.</p>
+            <p>Building them in one run is what guarantees they match. Two separate runs
+              can quietly disagree, and nothing downstream would tell you.</p>
+          </div>
+          <label v-if="!demOnly" class="hint toggle demtoggle">
+            <input type="checkbox" v-model="options.dem" />
+            Also export heightmap
+            <button class="ibtn" @click.prevent="toggleInfo('dem')" title="What this does">i</button>
+          </label>
+          <label v-if="options.dem" class="hint cellsize">Pixel size (m)
+            <input type="number" step="0.5" min="0.5" v-model.number="options.dem_px_m" />
+          </label>
+          <div class="pop" v-if="info === 'dem'">
+            <p>A GeoTIFF where every pixel is one ground height, with the buildings
+              included — the format the JAEA dose code reads.</p>
+            <p>Because it stores a single height per pixel, anything you can walk under
+              (a bridge, a canopy) becomes solid down to the ground.</p>
+            <p>It covers the whole area in real-world coordinates, so one file works for
+              every wind direction.</p>
+          </div>
           <div class="optbar">
             <span class="muted">{{ optSummary }}</span>
             <button class="link" @click="showAdvanced = true">⚙ Advanced</button>
           </div>
           <button v-if="!running" class="primary wide" :disabled="!canGenerate" @click="generate">
-            {{ rawMode ? 'Generate raw mesh' : 'Generate watertight STL' }}
+            {{ demOnly ? 'Generate GeoTIFF' : rawMode ? 'Generate raw model' : 'Generate model' }}
             <template v-if="windActive"> × {{ windDegs.length }}</template>
           </button>
           <button v-else class="wide danger" :disabled="cancelling" @click="cancelJob">
@@ -570,8 +686,9 @@ watch(logTail, () => {
           </div>
 
           <div class="resultbox" v-if="result" ref="resultBox">
-            <div v-if="jobWasRaw" class="warn">◆ high-fidelity raw mesh (not watertight, by design)</div>
-            <div v-else :class="result.all_watertight ?? result.watertight ? 'ok' : 'warn'">
+            <div v-if="result.dem_only" class="ok">✓ heightmap ready</div>
+            <div v-else-if="jobWasRaw" class="warn">◆ high-fidelity raw mesh (not watertight, by design)</div>
+            <div v-else-if="!result.dem_only" :class="result.all_watertight ?? result.watertight ? 'ok' : 'warn'">
               {{ (result.all_watertight ?? result.watertight)
                 ? (isMulti ? `✓ all ${outputs.length} watertight` : '✓ watertight')
                 : '⚠ not watertight' }}
@@ -591,12 +708,32 @@ watch(logTail, () => {
                   <td>{{ o.size_mb }}</td>
                   <td class="acts">
                     <button class="link" @click="showOutput(i)">3D</button>
-                    <a :href="fileUrl(o.filename)" download><button class="link">↓</button></a>
+                    <a :href="fileUrl(o.filename)" download
+                      :title="`watertight · ${o.size_mb} MB`"><button class="link">↓</button></a>
+                    <a v-if="o.raw_filename" :href="fileUrl(o.raw_filename)" download
+                      :title="`raw detail · ${o.raw_size_mb} MB`"><button class="link">↓raw</button></a>
                   </td>
                 </tr>
               </tbody>
             </table>
-            <div class="muted" v-else>{{ result.faces.toLocaleString() }} faces · {{ result.size_mb }} MB</div>
+            <div class="muted" v-else-if="!result.dem_only">{{ result.faces.toLocaleString() }} faces · {{ result.size_mb }} MB</div>
+            <p class="hint muted" v-if="result.dem_filename">
+              <code>{{ result.dem_filename }}</code> — {{ result.dem_size_px?.join(' × ') }}
+              pixels at {{ result.dem_px_m }} m, {{ result.dem_size_mb }} MB.
+              <template v-if="isMulti">Covers all {{ outputs.length }} directions.</template>
+              <template v-if="result.dem_overhang_frac > 0">
+                <br />{{ (result.dem_overhang_frac * 100).toFixed(2) }}% of building pixels
+                are overhangs —
+                {{ result.dem_overhang === 'drop' ? 'reported as ground' : 'filled solid' }}.
+              </template>
+            </p>
+            <p class="hint muted" v-if="result.raw_filename && !isMulti">
+              Plus <code>{{ result.raw_filename }}</code> ({{ result.raw_size_mb }} MB) —
+              same area, full detail, not watertight.
+            </p>
+            <p class="hint muted" v-else-if="isMulti && outputs[0]?.raw_filename">
+              Each direction also has a <code>.raw.stl</code> — same area and rotation.
+            </p>
 
             <div class="row">
               <!-- Always offer the bundle: the STL alone carries no metadata, so a bare
@@ -604,13 +741,24 @@ watch(logTail, () => {
                    rotation needed to georeference anything computed from it.
                    "View in 3D" used to sit here too -- removed, the 3D STL toggle in the
                    header already does exactly that and is always visible. -->
-              <a :href="bundleUrl" download class="btnlink">
+              <a v-if="result.dem_only" :href="fileUrl(result.dem_filename)" download class="btnlink">
+                <button class="primary">Download GeoTIFF</button>
+              </a>
+              <a v-else :href="bundleUrl" download class="btnlink">
                 <button class="primary">
-                  Download {{ isMulti ? `all ${outputs.length}` : 'STL' }} + sidecars
+                  Download {{ isMulti ? `all ${outputs.length}` : 'model' }} + details
                 </button>
               </a>
-              <a v-if="!isMulti" :href="downloadUrl" download class="btnlink">
-                <button>STL only</button>
+              <a v-if="!isMulti && !result.dem_only" :href="downloadUrl" download class="btnlink">
+                <button>Model only</button>
+              </a>
+              <a v-if="!isMulti && result.raw_filename" :href="fileUrl(result.raw_filename)"
+                download class="btnlink">
+                <button>Raw only</button>
+              </a>
+              <a v-if="result.dem_filename && !result.dem_only" :href="fileUrl(result.dem_filename)"
+                download class="btnlink">
+                <button>GeoTIFF only</button>
               </a>
             </div>
             <p class="hint muted" v-if="isMulti">
@@ -635,6 +783,7 @@ watch(logTail, () => {
             ? 'hover a direction to isolate it' : `wind from ${highlightDir}°` }}</span>
         </div>
         <StlViewer v-if="view === 'result'" :url="viewerUrl" />
+        <DemViewer v-if="view === 'dem'" :url="demPreviewUrl" />
         <div class="viewbadge" v-if="view === 'result' && isMulti">
           wind from <b>{{ outputs[selectedOutput].wind_from_deg }}°</b> · flow is +Y (inlet ymin)
         </div>
@@ -644,11 +793,11 @@ watch(logTail, () => {
     <div v-if="showAdvanced" class="modal-backdrop" @click.self="showAdvanced = false">
       <div class="modal">
         <h3>Advanced build settings</h3>
-        <label>Decimate error (m)
+        <label v-if="!demOnly">Decimate error (m)
           <input type="number" step="0.5" min="0" v-model="options.decimate_error" :disabled="rawMode" />
           <small class="muted">Max geometric error allowed when simplifying. Lower = more detail. Tie to your CFD cell size (~3m).</small>
         </label>
-        <label>Target reduction
+        <label v-if="!demOnly">Target reduction
           <input type="number" step="0.01" min="0" max="0.999" v-model="options.target_reduction" :disabled="rawMode" />
           <small class="muted">Face-removal cap (0.97). The error above usually governs unless this binds first.</small>
         </label>
@@ -691,11 +840,75 @@ watch(logTail, () => {
             while a hillside string terraced 8.7m.
           </small>
         </label>
-        <label class="row" style="align-items: center; gap: 8px;">
+        <label v-if="!demOnly" class="row" style="align-items: center; gap: 8px;">
           <input type="checkbox" v-model="options.include_base" />
           Include ground/terrain plane
           <small class="muted">Off = buildings only, no ground plate. In the watertight path the terrain still backs the voxel remesh internally and is subtracted at the end; in raw (voxel 0) mode it is simply not written.</small>
         </label>
+        <template v-if="options.dem">
+          <h4 class="modalsub">Heightmap</h4>
+          <label>Coordinate system
+            <select v-model="options.dem_crs">
+              <option :value="3414">EPSG:3414 — SVY21, metres</option>
+              <option :value="4326">EPSG:4326 — WGS84 lat/lon</option>
+            </select>
+            <small class="muted">Pixels are the size set above on the ground in either.</small>
+          </label>
+          <label>Samples per pixel
+            <input type="number" step="1" min="1" max="8" v-model.number="options.dem_supersample" />
+            <small class="muted">Each pixel is sampled on an
+              <b>{{ options.dem_supersample }}×{{ options.dem_supersample }}</b> grid
+              ({{ options.dem_supersample * options.dem_supersample }} height samples), and
+              the statistic below is taken over those. 1 means a single sample at the pixel
+              centre, so anything narrower than a pixel is hit or miss.</small>
+          </label>
+          <label>Height per pixel
+            <select v-model="options.dem_agg">
+              <option value="min">Minimum</option>
+              <option value="median">Median (p50) — default</option>
+              <option value="p90">90th percentile</option>
+              <option value="max">Maximum</option>
+            </select>
+            <small class="muted">
+              At a building edge the samples in a pixel are bimodal — roof and ground — so
+              the percentile acts as an area threshold on how much of the pixel the building
+              covers.
+              <template v-if="options.dem_agg === 'median'">
+                <b>Median</b> = building wins above 50% coverage. Footprint area measured
+                +4.9% against truth (60 boxes, random sub-pixel offsets).
+              </template>
+              <template v-else-if="options.dem_agg === 'max'">
+                <b>Max</b> = building wins at any coverage. Footprint area +34.8%, and
+                +21% implied building volume on a real domain.
+              </template>
+              <template v-else-if="options.dem_agg === 'min'">
+                <b>Min</b> = building wins only at 100% coverage. Footprint area −29.2%.
+              </template>
+              <template v-else>
+                <b>p90</b> = building wins above 10% coverage. Between median and max:
+                keeps narrow features median drops, at some dilation.
+              </template>
+            </small>
+          </label>
+          <label>Overhangs
+            <select v-model="options.dem_overhang">
+              <option value="keep">Fill the column (default)</option>
+              <option value="drop">Report ground height</option>
+            </select>
+            <small class="muted">One height per pixel cannot describe a column that is open
+              at ground level with structure above it — a bridge, a canopy, a void deck.
+              Detected as a column whose lowest building geometry clears the terrain by more
+              than 2 m. The affected fraction is reported with the result.</small>
+          </label>
+          <label>Contents
+            <select v-model="options.dem_source">
+              <option value="surface">Surface — ground and buildings (default)</option>
+              <option value="terrain">Ground only</option>
+            </select>
+            <small class="muted">Ground only still includes the graded pads the buildings
+              sit on, not the raw island DTM.</small>
+          </label>
+        </template>
         <div class="row modal-actions">
           <button @click="resetOptions">Reset defaults</button>
           <button class="primary" @click="showAdvanced = false">Done</button>
@@ -772,7 +985,7 @@ button.danger:not(:disabled):hover { background: rgba(255, 107, 107, 0.1); }
 
 .btnlink { display: inline-flex; text-decoration: none; }
 .btnlink > button { width: 100%; }
-.row > button, .row > .btnlink > button { min-height: 32px; }
+.row > button:not(.ibtn), .row > .btnlink > button { min-height: 32px; }
 
 /* Every button now has a visible hover and press state -- previously they just sat
    there, which reads as disabled. */
@@ -788,10 +1001,14 @@ button.primary:not(:disabled):hover { filter: brightness(1.12); }
 .btnlink > button:not(.primary):hover { color: var(--fg); }
 
 .cellsize { display: flex; align-items: center; gap: 6px; }
+.raw-also { margin-top: 8px; }
+.demtoggle { display: block; margin-top: 10px; }
+.modalsub { margin: 14px 0 0; font-size: 13px; }
 .cellsize input { width: 80px; }
 
 .ibtn {
-  width: 16px; height: 16px; padding: 0; margin-left: 6px; border-radius: 50%;
+  width: 16px; height: 16px; min-height: 16px; flex: 0 0 16px; box-sizing: border-box;
+  padding: 0; margin-left: 6px; border-radius: 50%;
   font-size: 10px; font-style: italic; line-height: 1; vertical-align: middle;
   background: transparent; color: var(--muted); border: 1px solid var(--border);
 }
@@ -839,7 +1056,10 @@ a { text-decoration: none; }
 .modal-actions { justify-content: flex-end; margin-top: 4px; }
 
 .bboxrow { display: flex; gap: 6px; margin-top: 8px; }
-.bboxrow input { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 11px; }
+.bboxrow input, .bboxrow textarea {
+  flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 11px;
+}
+.bboxrow textarea { resize: vertical; line-height: 1.5; }
 .bboxhint { margin-top: 4px; }
 .bboxhint code { font-size: 11px; }
 .bboxhint .warn { color: #ff9f43; }

@@ -603,6 +603,108 @@ leaves a tilted point cloud that `np.unique` cannot grid. `plot_dose.py` and
 
 ---
 
+## Which mesh does OpenMC run on? (open, 2026-09-02)
+
+Prompted by a plain question that turned out to be the right one: *should OpenMC run on the
+wind-rotated STL or an unrotated one, and if the tally is ROI-only, isn't the buffer
+pointless?* The buffer half is already answered above (source over everything, tally over
+the ROI — it is pointless for the tally and load-bearing for the source). The frame half is
+not, and it is a bigger decision than it looks.
+
+### The frame is a free choice; only the invariant is mandatory
+
+Rotation is a **rigid transform**, so a rotated mesh and a world mesh of the same region are
+the same geometry. The only hard rule is that **source, geometry and tally share one
+frame**. Everything else is bookkeeping.
+
+Today that frame is *rotated*, chosen for a good reason: Fluent emits tracks in the rotated
+frame, so leaving the geometry rotated means the source never moves relative to it. That is
+why this file says "never un-rotate before binning" — a rule that is correct **given
+rotated geometry** and becomes exactly wrong if the geometry moves to world. Whichever way
+this lands, it has to flip everywhere at once. A half-applied flip is the silent
+near-zero-dose map, which is the failure mode this file exists to prevent.
+
+### The observation that changes the shape of the problem
+
+**The geometry is identical for all N directions.** Buildings do not move. Only the
+*extent* differs — each wind rectangle is a sub-region of the build envelope, and
+`wind.check_envelope` already asserts every rectangle is strictly inside it with clearance.
+
+So the two consumers want genuinely different artifacts, and one file cannot be both:
+
+| | CFD (Fluent / FTM) | Dose (OpenMC / DAGMC) |
+|---|---|---|
+| frame | **rotated** — Fluent needs an axis-aligned inlet | **world** (proposed) |
+| extent | per-direction wind rectangle | the whole envelope |
+| form | raw soup (FTM wraps it) | watertight |
+| count | **N files** | **1 file** |
+
+Under that split: build one world-frame watertight envelope mesh, un-rotate each direction's
+tracks with `to_world` (already written), and run all N against the single `.h5m`. Every
+direction then tallies on the same world-aligned grid, so the frequency-weighted annual map
+is a plain weighted sum.
+
+**This subsumes the receptor-grid decision recorded above.** That section proposed keeping
+per-direction rotated geometry and rotating a world receptor grid *into* each frame. Moving
+the geometry to world gets the same result and also collapses N `.h5m` files to one — one
+geometry to `check_watertight`, one `overlap_check`, one set of material assignments. If
+this is adopted, the receptor-grid note becomes a description of the fallback, not the plan.
+
+### What it costs, honestly
+
+- The envelope is larger than any single rectangle — **8.78 km² vs ~1.26 km²** measured on
+  the Kent Ridge 8-direction case. More DAGMC surfaces in the BVH, but ray-tracing cost
+  grows roughly logarithmically in surface count, not linearly. **Unmeasured — measure
+  before committing.**
+- The source mesh becomes the world-frame bbox of the plume, which for a 45° bearing wastes
+  up to ~2× in zero-strength cells. Already argued above to be nearly free (runtime scales
+  with particles, not source cells), but it compounds with the point above.
+- It gives up the "geometry never moves relative to the source" safety property in exchange
+  for "there is only one geometry". Both are defensible; the second is easier to verify.
+
+### What NOT to do
+
+- **Do not clip the dose mesh to the ROI.** The plume lives in the buffer, and source points
+  born outside the geometry are born in vacuum — they stream out and take no attenuation or
+  buildup with them. ROI-only is a *tally* setting, not a geometry setting. This is the trap
+  behind "the buffer feels pointless": it is pointless for the tally and essential for the
+  source, and the two look like one decision until you separate them.
+- **Do not build a separate no-buffer watertight STL for dose.** It loses real dose (see the
+  `1 − exp(−R/λ)` table above) and buys nothing — the rotation lives in the sidecar keyed by
+  stem, so "it would carry no rotation information" was never the real constraint.
+
+### The clunkiness that is real, and cheap to fix
+
+Getting both artifacts today means **running generate twice** (toggle the voxel mode) and
+trusting that the two runs used identical settings — a silent-mismatch risk with no check
+anywhere. Everything up to the fuse is shared and the raw export is nearly free once the
+soup exists, so one job could emit `wind_045.raw.stl` + `wind_045.stl` + one sidecar
+covering both, same domain and same rotation by construction.
+
+Second gap, higher leverage for whoever inherits this: step 2 is a **manual Fluent GUI
+session, N times**. The sidecar already states that the setup is identical for every
+direction — that is the entire point of pre-rotating the geometry — so the bundle should
+ship a Fluent journal template.
+
+### Related build-side finding (2026-09-02)
+
+Raw mode + wind was exporting the **build envelope** for every direction instead of that
+direction's wind rectangle; watertight mode was correct all along. Root cause was invariant
+drift, not a physics or CSG problem: raw predates the wind feature, when `domain_polygon`
+*was* the ROI and there was nothing to clip. Wind redefined `domain_polygon` as the envelope
+and added `core_polygon`, the watertight tail was refactored to clip per direction, and
+raw's separate early-return branch silently kept the old assumption. Fixed with four
+`trimesh slice_plane(cap=False)` cuts — the mesh is already rotated at that point, so the
+rectangle is axis-aligned and no boolean is needed. Full record in the plan file.
+
+The naming lesson worth carrying into any of the above: there are **three** polygons, not
+two — the **ROI** (decides buildings and the tally), the **wind rectangle** (decides the CFD
+and dose extent, per direction), and the **envelope** (build-once scratch region, never
+shipped). Only the first and third have names in the code; the second exists solely as a
+loop variable, which is why it was easy to forget in one of two branches.
+
+---
+
 ## Mesh workstream closed (2026-08-27) — what it means for this pipeline
 
 Recorded here because it decides what geometry the dose work is built on.

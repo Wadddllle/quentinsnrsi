@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import sys
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -115,7 +116,14 @@ def build_dtm(xs, ys, zs, step, max_gap=None, bounds_override=None):
     return grid_z.astype("float32"), transform
 
 
-def write_geotiff(grid_z, transform, path=DTM_PATH, crs=TARGET_CRS):
+def write_geotiff(grid_z, transform, path=DTM_PATH, crs=TARGET_CRS, nodata=np.nan):
+    """Write a single-band north-up GeoTIFF.
+
+    `nodata` is a parameter rather than hardcoded NaN because not every consumer copes
+    with NaN -- a Fortran-ish reader will happily treat it as a number. Callers shipping
+    to an external code should pass an explicit sentinel (e.g. -9999.0).
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
         path,
@@ -127,7 +135,7 @@ def write_geotiff(grid_z, transform, path=DTM_PATH, crs=TARGET_CRS):
         dtype=grid_z.dtype,
         crs=crs,
         transform=transform,
-        nodata=np.nan,
+        nodata=nodata,
     ) as dst:
         dst.write(grid_z, 1)
 

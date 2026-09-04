@@ -21,7 +21,8 @@ from sbg.onemap_native.build import build_domain_stl
 _STAGES = {
     "[tiles]": "tiles", "[extract]": "extract", "[terrain]": "terrain",
     "[obj]": "write", "[scene]": "write", "[blender]": "fuse", "[fuse]": "fuse",
-    "[decimate]": "decimate", "[clip]": "clip", "[polish]": "polish", "[done]": "done",
+    "[decimate]": "decimate", "[clip]": "clip", "[polish]": "polish", "[dem]": "dem",
+    "[done]": "done",
 }
 _DIRECTION_RE = re.compile(r"^\[direction\] (\d+)/(\d+) wind from ([\d.]+)")
 
@@ -49,6 +50,13 @@ def _verify(stl_path, extra=None):
         "bounds": [[bb.min.x, bb.min.y, bb.min.z], [bb.max.x, bb.max.y, bb.max.z]],
         "size_mb": round(Path(stl_path).stat().st_size / 1e6, 1),
     }
+    # A raw companion, when one was requested, is a sibling of the watertight file --
+    # same run, same domain, same rotation. Reported as a plain size so the UI can offer
+    # it without needing to know how it was made.
+    raw = Path(stl_path).with_name(Path(stl_path).stem + ".raw" + Path(stl_path).suffix)
+    if raw.exists():
+        out["raw_filename"] = raw.name
+        out["raw_size_mb"] = round(raw.stat().st_size / 1e6, 1)
     out.update(extra or {})
     return out
 
@@ -84,6 +92,26 @@ def run_stl_job(job, domain_polygon, jobs_root, store_dir=None, log_extra=None,
                            core_polygon=core_polygon, wind=wind, **build_kwargs)
 
     job.set_stage("verify")
+    # GeoTIFF-only run: there is no mesh to verify, so none of the mesh-shaped result
+    # fields exist. The frontend keys off `dem_only` rather than guessing from absences.
+    if build_kwargs.get("dem_only"):
+        dem = Path(res)
+        result = {"dem_only": True, "count": 0, "outputs": [], "wind": bool(wind),
+                  "dem_filename": dem.name,
+                  "dem_size_mb": round(dem.stat().st_size / 1e6, 2),
+                  "elapsed_s": round(time.perf_counter() - t0, 1)}
+        try:
+            import json
+            meta = json.loads(dem.with_suffix(".json").read_text())
+            result.update(dem_crs=meta.get("crs"), dem_px_m=meta.get("pixel_size_m"),
+                          dem_agg=meta.get("agg"), dem_overhang=meta.get("overhang"),
+                          dem_overhang_frac=meta.get("overhang_subpixel_fraction"),
+                          dem_size_px=[meta.get("width"), meta.get("height")])
+        except Exception:
+            pass
+        job.log_line(f"[verify] {dem.name}: {result['dem_size_mb']} MB")
+        return result
+
     if isinstance(res, list):        # wind run: one entry per direction
         outputs = [_verify(r["stl"], {
             "wind_from_deg": r["wind_from_deg"],
@@ -100,6 +128,26 @@ def run_stl_job(job, domain_polygon, jobs_root, store_dir=None, log_extra=None,
         "all_watertight": all(o["watertight"] for o in outputs),
         "elapsed_s": round(time.perf_counter() - t0, 1),
     })
+
+    # The DEM is reported at JOB level, not per output. It is written once, in the true
+    # world frame, and serves every wind direction -- so hanging it off each output row
+    # would claim N files where there is one. Discovered on disk rather than threaded back
+    # through build_domain_stl's return value, matching how _verify finds the raw twin.
+    dem = job_dir / "domain.dem.tif"
+    if dem.is_file():
+        result["dem_filename"] = dem.name
+        result["dem_size_mb"] = round(dem.stat().st_size / 1e6, 2)
+        try:
+            import json
+            meta = json.loads(dem.with_suffix(".json").read_text())
+            result.update(dem_crs=meta.get("crs"), dem_px_m=meta.get("pixel_size_m"),
+                          dem_agg=meta.get("agg"), dem_overhang=meta.get("overhang"),
+                          dem_overhang_frac=meta.get("overhang_subpixel_fraction"),
+                          dem_size_px=[meta.get("width"), meta.get("height")])
+        except Exception:
+            pass
+        job.log_line(f"[verify] {dem.name}: {result['dem_size_mb']} MB "
+                     f"({result.get('dem_crs')}, {result.get('dem_px_m')} m/px)")
 
     for o in outputs:
         vol = f"{o['volume_m3']:.4e}" if o["volume_m3"] is not None else "n/a"

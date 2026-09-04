@@ -77,13 +77,13 @@ class Job:
                 self.log.append(f"[{self.stage}] took {elapsed:.1f}s")
             self.stage = stage
             self.substage = None
+            self._stage_started_at = now
+            self.log.append(stage)
             _cancel = self.cancel_requested
         # Outside the lock: every stage transition is a cancellation checkpoint, so a
         # pipeline gets this for free without any per-stage checking code.
         if _cancel:
             raise JobCancelled()
-            self._stage_started_at = now
-            self.log.append(stage)
 
     def log_line(self, line):
         with _lock:

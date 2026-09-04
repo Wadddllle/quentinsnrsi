@@ -31,7 +31,7 @@ button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #06101f; font-weight: 600; }
 button.active { background: var(--accent); border-color: var(--accent); color: #06101f; }
-input, select {
+input, select, textarea {
   font: inherit;
   color: var(--text);
   background: var(--panel);

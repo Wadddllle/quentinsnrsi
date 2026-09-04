@@ -151,7 +151,7 @@ def _provenance(store_dir=None, opts=None):
 
 
 def _write_build_sidecar(stl_path, domain_poly, core_poly, h_exact, log,
-                         store_dir=None, opts=None):
+                         store_dir=None, opts=None, dem_name=None):
     """`<stem>.build.json` for a plain (non-wind) build.
 
     A wind build already gets `<stem>.wind.json`, which carries the same provenance plus
@@ -182,6 +182,14 @@ def _write_build_sidecar(stl_path, domain_poly, core_poly, h_exact, log,
     except Exception as e:                       # a raw/soup export may not load cleanly
         doc["mesh_stats_error"] = str(e)
 
+    _r = _raw_path(stl_path)
+    if _r.exists():
+        doc["raw_stl"] = _r.name
+        doc["raw_note"] = _RAW_NOTE
+    if dem_name:
+        doc["dem_tif"] = dem_name
+        doc["dem_note"] = _DEM_NOTE
+
     p = Path(stl_path).with_suffix(".build.json")
     p.write_text(json.dumps(doc, indent=2))
     log(f"[sidecar] {p.name}")
@@ -190,7 +198,7 @@ def _write_build_sidecar(stl_path, domain_poly, core_poly, h_exact, log,
 
 def _write_wind_sidecar(stl_path, wind_from_deg, psi_deg, centre, core_poly,
                         rect_rot, wind, h_exact, log, clipped=True,
-                        store_dir=None, opts=None):
+                        store_dir=None, opts=None, dem_name=None):
     """Write `<stem>.wind.json` next to an STL. Returns a dict describing the output.
 
     Written HERE and not in the UI job layer, because the rotation is a property of the
@@ -290,10 +298,25 @@ def _write_wind_sidecar(stl_path, wind_from_deg, psi_deg, centre, core_poly,
         }
     else:
         doc["note_unclipped"] = (
-            "RAW mode performs no clip, so the mesh extent is the BUILD ENVELOPE, not the "
-            "wind rectangle, and 'inlet = ymin' is not a claim about its walls. This is "
-            "fine for Ansys fault-tolerant meshing and snappyHexMesh, which build their "
-            "own enclosure / background mesh; it is not a watertight CFD domain.")
+            "The mesh extent is the BUILD ENVELOPE, not the wind rectangle, so "
+            "'inlet = ymin' is not a claim about its walls. This is fine for Ansys "
+            "fault-tolerant meshing and snappyHexMesh, which build their own enclosure / "
+            "background mesh; it is not a watertight CFD domain.")
+    if holes:
+        doc["note_open"] = (
+            "RAW mode: this is an OPEN triangle soup, not a closed solid. The extent is "
+            "the wind rectangle above, but the domain walls themselves are open cuts -- "
+            "the consumer builds its own enclosure (Ansys fault-tolerant meshing, "
+            "snappyHexMesh). The Ansys watertight workflow will reject it; use a voxel "
+            "size > 0 for that.")
+
+    _r = _raw_path(stl_path)
+    if _r.exists():
+        doc["raw_stl"] = _r.name
+        doc["raw_note"] = _RAW_NOTE
+    if dem_name:
+        doc["dem_tif"] = dem_name
+        doc["dem_note"] = _DEM_NOTE
 
     p = Path(stl_path).with_suffix(".wind.json")
     p.write_text(json.dumps(doc, indent=2))
@@ -302,6 +325,53 @@ def _write_wind_sidecar(stl_path, wind_from_deg, psi_deg, centre, core_poly,
     return {"wind_from_deg": float(wind_from_deg), "stl": str(stl_path),
             "sidecar": str(p), "watertight": holes == 0, "holes": holes,
             "faces": int(ml.topology.numValidFaces())}
+
+
+_RAW_NOTE = ("Same geometry, same domain, same rotation as this STL -- built in the same "
+             "run, so they cannot disagree. The raw file is the un-fused OneMap soup at "
+             "full LiDAR detail: use it for Ansys fault-tolerant meshing and "
+             "snappyHexMesh, which build their own enclosure. Use the watertight file for "
+             "DAGMC/OpenMC, which must ray-trace a closed solid. Do not mix a raw file "
+             "from one run with a watertight file from another.")
+
+
+_DEM_NOTE = ("A GeoTIFF where every pixel is a height (terrain with buildings baked in), "
+             "sampled from the same un-fused geometry as this STL, in the same run. Always "
+             "north-up in TRUE world coordinates -- under a wind rose there is ONE DEM for "
+             "the whole build, not one per direction, because the geometry is identical for "
+             "every bearing and only the clip differs. So it does NOT share the rotated "
+             "frame of the wind-aligned STLs: un-rotate rotated-frame coordinates (see the "
+             "`rotation` block of the .wind.json sidecar) before georeferencing against it.")
+
+
+def _raw_path(stl_path):
+    """`domain.stl` -> `domain.raw.stl`. One place, so the two writers cannot drift."""
+    p = Path(stl_path)
+    return p.with_name(p.stem + ".raw" + p.suffix)
+
+
+def _export_raw(verts, faces, out_path, log, *, rect_rot=None, label=""):
+    """Write the un-fused OneMap soup to STL, optionally trimmed to an axis-aligned rect.
+
+    NOT a boolean. When a rect is given the mesh is already rotated, so the rectangle is
+    axis-aligned and four per-triangle plane cuts do the job with no CSG and no
+    watertightness assumption. `cap=False` is deliberate -- raw's contract is an open
+    soup, so the cut leaves an open wall exactly like every other raw boundary.
+    """
+    import trimesh
+    m = trimesh.Trimesh(verts, faces, process=False)
+    if rect_rot is not None:
+        x0, y0, x1, y1 = rect_rot.bounds
+        for origin, normal in (((x0, 0, 0), (1, 0, 0)), ((x1, 0, 0), (-1, 0, 0)),
+                               ((0, y0, 0), (0, 1, 0)), ((0, y1, 0), (0, -1, 0))):
+            m = m.slice_plane(plane_origin=origin, plane_normal=normal, cap=False)
+            if m is None or len(m.faces) == 0:
+                raise RuntimeError(
+                    f"raw clip left an empty mesh{label}; the build envelope does not "
+                    f"cover this direction's rectangle")
+    m.export(str(out_path))
+    log(f"[raw] {Path(out_path).name}: {len(m.faces):,} faces (open soup, full LiDAR detail)")
+    return len(m.faces)
 
 
 def _finish_one(mesh_v, mesh_f, clip_polygon, out_stl, log, *,
@@ -595,7 +665,9 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
                      store_dir=None, workdir=None, log=None, include_base=True,
                      fuse_backend="meshlib", core_polygon=None, wind=None,
                      placement="drape", coupling_lambda=None, check_contours=False,
-                     crossing="auto"):
+                     crossing="auto", include_raw=False, dem=False, dem_px_m=4.0,
+                     dem_crs=3414, dem_agg="median", dem_overhang="keep",
+                     dem_supersample=4, dem_source="surface", dem_only=False):
     """Run the full tile-native pipeline for one domain polygon (EPSG:3414).
 
     `core_polygon` is the region of interest -- the polygon that decides which BUILDINGS
@@ -606,6 +678,24 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     `wind` (optional) turns this into a build-once/rotate-and-clip-per-direction run:
     every heavy stage runs ONCE and each extra bearing costs only a rotate + clip +
     polish. Returns a list of per-direction dicts instead of a single path.
+
+    `include_raw` additionally writes the un-fused soup as `<stem>.raw.stl` beside each
+    watertight output. The dose pipeline needs BOTH -- raw for Ansys fault-tolerant
+    meshing (the CFD side), watertight for DAGMC (which has to ray-trace a closed solid)
+    -- and they must describe the same geometry or the particle tracks and the .h5m
+    silently disagree. Producing them from one run makes that mismatch impossible;
+    building them as two separate jobs makes it invisible. Nearly free, because
+    everything up to the fuse is shared and the raw export is just the soup already in
+    memory. Ignored when voxel_size <= 0, where the raw file IS the output.
+
+    `dem` additionally writes `<stem>.dem.tif` -- a GeoTIFF where every pixel is a height,
+    which is what the JAEA dose code ingests. It is sampled from the SAME un-fused arrays
+    the raw export uses, before the fuse: a top-down max never asks whether a mesh is
+    closed, so the voxel staircase and decimation error of the finished STL are pure loss
+    here. Under wind it is written ONCE, in the true world frame: geometry is built once
+    and only the clip differs per direction, so one north-up raster serves every bearing --
+    and north-up is the only thing ModelPixelScale + ModelTiepoint can express anyway.
+    See sbg/onemap_native/dem.py for the two sampling knobs (`dem_agg`, `dem_overhang`).
     """
     import time
     _sink = log
@@ -624,6 +714,9 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     workdir.mkdir(parents=True, exist_ok=True)
 
     core_polygon = domain_polygon if core_polygon is None else core_polygon
+    # Asking for the GeoTIFF alone implies asking for the GeoTIFF.
+    if dem_only:
+        dem = True
 
     # What happens to a building straddling the ROI edge. "auto" is the only setting
     # that is right in both worlds, so it is the default:
@@ -642,13 +735,39 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     buffered = core_polygon is not domain_polygon
     require_full = (not buffered) if crossing == "auto" else (crossing == "drop")
 
+    # Fail before doing 30s of work, not after. include_base=False puts every building on a
+    # common z=0 datum with no terrain at all (see the FLAT-GROUND branch below), so a
+    # terrain raster there would be neither ground nor buildings-at-their-real-elevation --
+    # it would be a plausible-looking lie. Refuse rather than emit one.
+    if dem and not include_base:
+        raise ValueError("--dem needs terrain, but include_base=False is the flat-ground "
+                         "mode: buildings sit on a common z=0 datum and no terrain is built, "
+                         "so a height raster would be meaningless. Drop --no-base, or build "
+                         "the DEM from a separate run.")
+    if dem:
+        from sbg.onemap_native import dem as _demmod
+        if dem_agg not in _demmod.AGGS:
+            raise ValueError(f"dem_agg must be one of {_demmod.AGGS}, got {dem_agg!r}")
+        if dem_overhang not in _demmod.OVERHANGS:
+            raise ValueError(f"dem_overhang must be one of {_demmod.OVERHANGS}, "
+                             f"got {dem_overhang!r}")
+        if int(dem_crs) not in _demmod.CRS_CHOICES:
+            raise ValueError(f"dem_crs must be one of {_demmod.CRS_CHOICES}, got {dem_crs!r}")
+        if not (dem_px_m and float(dem_px_m) > 0):
+            raise ValueError(f"dem_px_m must be > 0, got {dem_px_m!r}")
+
     # Recorded verbatim into every sidecar. These are exactly the knobs that change the
     # output geometry, so a mesh can be reproduced from its sidecar alone.
     _opts = dict(step=step, voxel_size=voxel_size, target_reduction=target_reduction,
                  decimate_error=decimate_error, include_base=include_base,
                  fuse_backend=fuse_backend, placement=placement,
                  coupling_lambda=coupling_lambda, crossing=crossing,
-                 crossing_effective="drop" if require_full else "keep")
+                 crossing_effective="drop" if require_full else "keep",
+                 include_raw=bool(include_raw), dem=bool(dem))
+    if dem:
+        _opts.update(dem_px_m=float(dem_px_m), dem_crs=int(dem_crs), dem_agg=dem_agg,
+                     dem_overhang=dem_overhang, dem_supersample=int(dem_supersample),
+                     dem_source=dem_source)
 
     xmin, ymin, xmax, ymax = domain_polygon.bounds
     cxmin, cymin, cxmax, cymax = core_polygon.bounds
@@ -793,24 +912,61 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
         log(f"[terrain] flat-base solid: z {base_z:.0f}-{terr_v[:, 2].max():.0f}m, "
             f"{len(terr_f):,} faces")
 
+    # JAEA mode. This is the ONLY point where terrain and buildings are both live AND in the
+    # true world frame: the raw branch below returns early in raw-only mode, and after the
+    # fuse both arrays are del'd (only the rotated _V/_F survive into the wind loop). Under
+    # wind this therefore writes exactly one world-frame raster, which is correct rather
+    # than merely convenient -- the geometry is identical for every bearing.
+    #
+    # The terrain SOLID is passed as-is rather than its top surface: the bottom cap sits at
+    # base_z (<= 0, always under the ground) and the side walls are vertical, so a top-down
+    # max ignores both. That avoids coupling this to terrain_flat_base_solid's face ordering.
+    _dem_path = None
+    if dem:
+        _dem_t0 = time.perf_counter()
+        from sbg.onemap_native.dem import build_dem, write_dem
+        _g, _a, _meta = build_dem(terr_v, terr_f, bld_v, bld_f, domain_polygon, dtm,
+                                  px_m=float(dem_px_m), crs=int(dem_crs), agg=dem_agg,
+                                  overhang=dem_overhang, supersample=int(dem_supersample),
+                                  source=dem_source, log=log)
+        _meta["domain_ring_m"] = np.asarray(domain_polygon.exterior.coords,
+                                            dtype=float)[:, :2].tolist()
+        _dem_path, _ = write_dem(_g, _a, _meta,
+                                 Path(out_stl).with_suffix(".dem.tif"), log=log)
+        del _g
+        if dem_only:
+            # Everything past this point exists to make a MESH. The DEM is already on
+            # disk, so stop -- skipping the fuse, decimate, clip and polish entirely.
+            log(f"[done] {_dem_path.name} in {time.perf_counter() - _dem_t0:.1f}s "
+                f"(GeoTIFF only -- no mesh built)")
+            return _dem_path
+
     # High-fidelity raw mode (voxel_size <= 0): skip the whole watertight machinery and
     # dump the real OneMap meshes straight to STL. Preserves full LiDAR detail and is
     # fast, but is a non-watertight triangle soup -- ACCEPTED by Ansys fault-tolerant
     # meshing (already the production path there) and by snappyHexMesh, which meshed it
     # at 1,030,259 cells with no errors; rejected only by the Ansys *watertight* workflow.
-    if voxel_size is not None and voxel_size <= 0:
-        import trimesh
+    _raw_only = voxel_size is not None and voxel_size <= 0
+    if _raw_only or include_raw:
         if include_base:
-            verts = np.vstack([terr_v, bld_v])
-            faces = np.vstack([terr_f, bld_f + len(terr_v)])
+            _rv = np.vstack([terr_v, bld_v])
+            _rf = np.vstack([terr_f, bld_f + len(terr_v)])
         else:
-            verts, faces = bld_v, bld_f
+            _rv, _rf = bld_v, bld_f
+
+        # Where the raw file lands. Raw-only mode owns the requested name; the combined
+        # mode is a SECOND artifact alongside the watertight one, so it takes the `.raw`
+        # variant and the watertight keeps the plain name (that is the file most tools
+        # want, and the one existing download links already point at).
+        _raw_names = ({} if not wind else
+                      {wf: Path(out_stl).parent /
+                       (f"wind_{int(round(wf)) % 360:03d}" + ("" if _raw_only else ".raw") + ".stl")
+                       for wf in wind["dirs"]})
 
         if wind:
-            # RAW mode performs NO clip, so each output's extent is the build envelope,
-            # not the wind rectangle, and "inlet = ymin" is not a claim about its walls.
-            # The sidecar says so via clipped=False. Do NOT try to clip the raw soup:
-            # boolean on un-fused soup is exactly the failure this pipeline avoids.
+            # Each direction is trimmed to ITS OWN wind rectangle, not left at the build
+            # envelope. Without this, N directions produce N rotated copies of the whole
+            # envelope hull -- visibly wrong, and it silently makes "inlet = ymin" false.
             from sbg.onemap_native.wind import flow_bearing_deg, rotate_xy, wind_rect
             centre = np.asarray(wind["centre"], dtype=float)[:2]
             out_dir = Path(out_stl).parent
@@ -819,27 +975,30 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
             for i, wf in enumerate(wind["dirs"], 1):
                 psi = flow_bearing_deg(wf)
                 log(f"[direction] {i}/{len(wind['dirs'])} wind from {wf:g} deg (raw)")
-                p = out_dir / f"wind_{int(round(wf)) % 360:03d}.stl"
-                trimesh.Trimesh(rotate_xy(verts, psi, centre), faces,
-                                process=False).export(str(p))
                 rect_rot, _ = wind_rect(core_polygon, centre, psi,
                                         wind["up_m"], wind["down_m"], wind["lat_m"])
-                outs.append(_write_wind_sidecar(p, wf, psi, centre, core_polygon,
-                                                rect_rot, wind, h_exact, log,
-                                                clipped=False, store_dir=store_dir,
-                                                opts=_opts))
-            log(f"[done] {len(outs)} raw direction(s) in {out_dir}  "
-                f"(UNCLIPPED soup -- extent is the build envelope, not the wind rect)")
-            return outs
-
-        trimesh.Trimesh(verts, faces, process=False).export(str(out_stl))
-        log(f"[raw] high-fidelity NON-watertight mesh: {len(faces):,} faces "
-            f"({'with' if include_base else 'without'} ground plane; "
-            f"skipped fuse/decimate/clip/polish)")
-        log(f"[done] {out_stl}  (raw high-fidelity soup -- not watertight by design)")
-        _write_build_sidecar(out_stl, domain_polygon, core_polygon, h_exact, log,
-                             store_dir=store_dir, opts=_opts)
-        return out_stl
+                _export_raw(rotate_xy(_rv, psi, centre), _rf, _raw_names[wf], log,
+                            rect_rot=rect_rot, label=f" for wind_from={wf:g}")
+                if _raw_only:
+                    outs.append(_write_wind_sidecar(
+                        _raw_names[wf], wf, psi, centre, core_polygon, rect_rot, wind,
+                        h_exact, log, clipped=True, store_dir=store_dir, opts=_opts,
+                        dem_name=_dem_path.name if _dem_path else None))
+            if _raw_only:
+                log(f"[done] {len(outs)} raw direction(s) in {out_dir}  "
+                    f"(trimmed to each wind rectangle; open soup, not watertight)")
+                return outs
+        else:
+            _raw_out = out_stl if _raw_only else _raw_path(out_stl)
+            _export_raw(_rv, _rf, _raw_out, log,
+                        label=f" ({'with' if include_base else 'without'} ground plane)")
+            if _raw_only:
+                log(f"[done] {out_stl}  (raw high-fidelity soup -- not watertight by design)")
+                _write_build_sidecar(out_stl, domain_polygon, core_polygon, h_exact, log,
+                                     store_dir=store_dir, opts=_opts,
+                                     dem_name=_dem_path.name if _dem_path else None)
+                return out_stl
+        del _rv, _rf
 
     import meshlib.mrmeshpy as mr
 
@@ -909,7 +1068,8 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
         p = _finish_one(_V, _F, domain_polygon, out_stl, log,
                         expect_disconnected=_flat)
         _write_build_sidecar(p, domain_polygon, core_polygon, h_exact, log,
-                             store_dir=store_dir, opts=_opts)
+                             store_dir=store_dir, opts=_opts,
+                             dem_name=_dem_path.name if _dem_path else None)
         return p
 
     # ---- BUILD ONCE, ROTATE + CLIP PER DIRECTION -----------------------------------
@@ -941,7 +1101,8 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
         _finish_one(Vr, _F, rect_rot, p, log, expect_disconnected=_flat)
         outputs.append(_write_wind_sidecar(p, wf, psi, centre, core, rect_rot,
                                            wind, h_exact, log, store_dir=store_dir,
-                                           opts=_opts))
+                                           opts=_opts,
+                                           dem_name=_dem_path.name if _dem_path else None))
 
     log(f"[done] {len(outputs)} direction(s) written to {out_dir}")
     return outputs
@@ -996,16 +1157,14 @@ def main():
                          "upstream roughness must be supplied as a Fluent wall BC -- the "
                          "mesh does NOT encode it.")
     ap.add_argument("--fuse-backend", choices=("meshlib", "blender"), default="meshlib",
-                    help="voxel-remesh backend. Both call OpenVDB; the FUSE STEP is "
-                         "equivalent (1,300,768 faces either way, volume differing by 1 m3 "
-                         "in 37.4M) and meshlib is 4.25x faster (0.8s vs 3.4s) with no "
-                         "Blender install. BUT end-to-end they are NOT identical: on Kent "
-                         "Both call OpenVDB and are equivalent end-to-end: measured on 3 real "
-                         "domains, both give holes=0 / 0 open / 0 non-manifold / 0 zero-area / "
-                         "strictly watertight / 1 body, with volume agreeing to 0.001-0.004%. "
-                         "meshlib is 4.25x faster on the fuse (0.8s vs 3.4s) and needs no Blender "
-                         "install, so it is the default; 'blender' is an escape hatch requiring "
-                         "SBG_BLENDER_PATH.")
+                    help="voxel-remesh backend. Both call OpenVDB and are equivalent "
+                         "end-to-end: measured on 3 real domains, both give holes=0 / 0 open "
+                         "/ 0 non-manifold / 0 zero-area / strictly watertight / 1 body, with "
+                         "volume agreeing to 0.001-0.004%%. The fuse step itself is identical "
+                         "too (1,300,768 faces either way, volume differing by 1 m3 in 37.4M). "
+                         "meshlib is 4.25x faster on the fuse (0.8s vs 3.4s) and needs no "
+                         "Blender install, so it is the default; 'blender' is an escape hatch "
+                         "requiring SBG_BLENDER_PATH.")
     ap.add_argument("--placement", choices=("group", "drape", "laplacian"),
                     default="drape",
                     help="how connected buildings spanning relief are levelled: "
@@ -1030,12 +1189,54 @@ def main():
                     help=f"--placement laplacian only (default {COUPLING_LAMBDA:g}). "
                          "Higher = flatter/more grouped, lower = more terracing; "
                          "inf == --placement group, 0 == --placement drape")
+    ap.add_argument("--also-raw", action="store_true",
+                    help="additionally write the un-fused full-detail soup as "
+                         "<stem>.raw.stl beside each watertight output. The dose pipeline "
+                         "needs both (raw -> Ansys fault-tolerant meshing for the CFD, "
+                         "watertight -> DAGMC/OpenMC), and producing them in one run is "
+                         "what guarantees they describe the same geometry. Ignored with "
+                         "--voxel-size 0, where the raw file is already the output.")
     ap.add_argument("--no-base", action="store_true",
                     help="exclude the ground/terrain plane from the exported STL (buildings only). "
                          "Terrain still backs the voxel remesh internally -- an A/B test showed "
                          "excluding it from the JOIN makes ordinary ground-level buildings visibly "
                          "worse (shattered vs. solid); this only strips it from the final file, as a "
                          "late boolean subtraction, matching a normal CFD obstacle-only export.")
+    ap.add_argument("--dem", action="store_true",
+                    help="JAEA mode: additionally write <stem>.dem.tif, a north-up GeoTIFF "
+                         "where every pixel is a height (terrain with buildings baked in), "
+                         "plus a .dem.json sidecar carrying the tie point. Sampled from the "
+                         "un-fused geometry, so it has no voxel staircase or decimation "
+                         "error. Under a wind rose it is written ONCE in the true world "
+                         "frame -- the geometry is identical for every bearing.")
+    ap.add_argument("--dem-only", action="store_true",
+                    help="write ONLY the GeoTIFF -- no STL. Stops after the DEM, skipping "
+                         "the fuse, decimate, clip and polish. Implies --dem.")
+    ap.add_argument("--dem-px", type=float, default=4.0, dest="dem_px",
+                    help="DEM pixel size in metres (default 4). In EPSG:4326 the degree "
+                         "pixel is derived so both axes are still exactly this on the ground.")
+    ap.add_argument("--dem-crs", type=int, default=3414, choices=(3414, 4326),
+                    help="DEM output CRS (default 3414, the pipeline's native metric grid)")
+    ap.add_argument("--dem-agg", default="median",
+                    choices=("min", "p10", "median", "p50", "p90", "p95", "max", "mean"),
+                    help="how the sub-samples in one pixel collapse to one height. For a "
+                         "cell straddling a building edge the distribution is bimodal, so "
+                         "percentile p IS a coverage threshold at (100-p)%%: median = 'more "
+                         "than half this cell is inside', which measured +4.9%% footprint "
+                         "area against truth. max measured +34.8%% (the half-pixel dilation) "
+                         "and mean invents heights halfway up walls. Default median.")
+    ap.add_argument("--dem-overhang", default="keep", choices=("keep", "drop"),
+                    help="a heightfield cannot express solid/void/solid, so under a bridge "
+                         "or canopy the max fills to the ground. 'keep' is the classic DSM "
+                         "(conservative for shielding); 'drop' reverts columns whose lowest "
+                         "building geometry floats clear of the terrain back to ground "
+                         "(correct for flow). The affected fraction is logged either way.")
+    ap.add_argument("--dem-supersample", type=int, default=4, dest="dem_supersample",
+                    help="samples per pixel axis (default 4, i.e. 16 per pixel). 1 = plain "
+                         "pixel-centre sampling, which drops sub-pixel structure entirely.")
+    ap.add_argument("--dem-source", default="surface", choices=("surface", "terrain"),
+                    help="'surface' = terrain with buildings (a DSM, the default); "
+                         "'terrain' = bare ground as built, including the graded pads.")
     args = ap.parse_args()
 
     domain = load_domain_polygon(bbox=args.bbox, domain_geojson=args.domain_geojson,
@@ -1088,7 +1289,11 @@ def main():
                      include_base=not args.no_base, placement=args.placement,
                      coupling_lambda=args.coupling_lambda,
                      check_contours=args.check_contours,
-                     crossing=args.crossing)
+                     crossing=args.crossing, include_raw=args.also_raw,
+                     dem=args.dem, dem_px_m=args.dem_px, dem_crs=args.dem_crs,
+                     dem_agg=args.dem_agg, dem_overhang=args.dem_overhang,
+                     dem_supersample=args.dem_supersample, dem_source=args.dem_source,
+                     dem_only=args.dem_only)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from shapely.geometry import Polygon, box
 
@@ -45,13 +45,18 @@ STL_JOBS_DIR = DATA_DIR / "v2_stl_jobs"
 # the tuned defaults from build.py)
 _BUILD_OPTS = {"step", "voxel_size", "target_reduction", "decimate_error", "workers",
                "include_base", "placement", "coupling_lambda", "fuse_backend",
-               "crossing"}
+               "crossing", "include_raw", "dem", "dem_px_m", "dem_crs", "dem_agg",
+               "dem_overhang", "dem_supersample", "dem_source", "dem_only"}
 _PLACEMENTS = ("group", "drape", "laplacian")
 _CROSSING = ("auto", "drop", "keep")
 _FUSE_BACKENDS = ("meshlib", "blender")
+_DEM_AGGS = ("min", "p10", "median", "p50", "p90", "p95", "max", "mean")
+_DEM_OVERHANGS = ("keep", "drop")
+_DEM_CRS = (3414, 4326)
+_DEM_SOURCES = ("surface", "terrain")
 # Serving from a job dir means a client-supplied filename reaches the filesystem.
 # Extensions the pipeline actually produces; everything else is refused outright.
-_SERVABLE_SUFFIXES = (".stl", ".json")
+_SERVABLE_SUFFIXES = (".stl", ".json", ".tif")
 
 
 def _domain_polygon(payload):
@@ -151,7 +156,7 @@ def create_app(store_dir=None, dev=False):
         # manual restart -- and an older build silently IGNORED an unknown `wind`
         # field rather than rejecting it, happily returning one axis-aligned domain to
         # a user who asked for eight rotated ones. Silent version skew, no error.
-        return {"ok": True, "features": ["wind", "multi_output", "bundle"]}
+        return {"ok": True, "features": ["wind", "multi_output", "bundle", "dem"]}
 
     @app.get("/api/footprints")
     def footprints():
@@ -214,6 +219,25 @@ def create_app(store_dir=None, dev=False):
             raise HTTPException(400, f"fuse_backend must be one of {_FUSE_BACKENDS}")
         if opts.get("crossing") not in (None,) + _CROSSING:
             raise HTTPException(400, f"crossing must be one of {_CROSSING}")
+        if opts.get("dem_agg") not in (None,) + _DEM_AGGS:
+            raise HTTPException(400, f"dem_agg must be one of {_DEM_AGGS}")
+        if opts.get("dem_overhang") not in (None,) + _DEM_OVERHANGS:
+            raise HTTPException(400, f"dem_overhang must be one of {_DEM_OVERHANGS}")
+        if opts.get("dem_source") not in (None,) + _DEM_SOURCES:
+            raise HTTPException(400, f"dem_source must be one of {_DEM_SOURCES}")
+        if opts.get("dem_crs") is not None and int(opts["dem_crs"]) not in _DEM_CRS:
+            raise HTTPException(400, f"dem_crs must be one of {_DEM_CRS}")
+        if opts.get("dem_px_m") is not None and not float(opts["dem_px_m"]) > 0:
+            raise HTTPException(400, "dem_px_m must be > 0")
+        # Caught here as a 400 rather than surfacing as a job traceback: the two options
+        # are individually valid and only their combination is meaningless.
+        if opts.get("dem_only") and opts.get("include_base") is False:
+            raise HTTPException(400, "a DEM needs terrain, so it cannot be built with "
+                                     "include_base=false")
+        if opts.get("dem") and opts.get("include_base") is False:
+            raise HTTPException(400, "dem needs terrain: include_base=false is the "
+                                     "flat-ground mode (buildings on a common z=0 datum, "
+                                     "no terrain), so a height raster would be meaningless")
 
         # Re-resolved server-side from the same plan_wind() the preview used, so the
         # geometry cannot drift between what the user approved and what is built. The
@@ -248,6 +272,9 @@ def create_app(store_dir=None, dev=False):
         job = get_job(job_id)
         if job is None or job.status != "done" or not job.result:
             raise HTTPException(404, "job not finished")
+        if not job.result.get("stl_path"):
+            raise HTTPException(404, "this job produced no mesh (GeoTIFF only); "
+                                     "fetch it from /files/<name>")
         path = job.result["stl_path"]
         return FileResponse(path, media_type="model/stl",
                             filename=f"cfd_domain_{job_id[:8]}.stl")
@@ -255,8 +282,42 @@ def create_app(store_dir=None, dev=False):
     @app.get("/api/stl/jobs/{job_id}/files/{name}")
     def stl_file(job_id: str, name: str):
         p = _job_file(job_id, name)
-        media = "model/stl" if p.suffix == ".stl" else "application/json"
+        media = {".stl": "model/stl", ".tif": "image/tiff"}.get(p.suffix,
+                                                                 "application/json")
         return FileResponse(str(p), media_type=media, filename=p.name)
+
+    @app.get("/api/stl/jobs/{job_id}/dem_preview")
+    def stl_dem_preview(job_id: str):
+        """The DEM as a raw height grid, for the in-app viewer.
+
+        A browser cannot decode a GeoTIFF, and re-encoding to PNG would throw away the
+        real heights the viewer needs to build a surface. So this ships the grid itself:
+        a 16-byte header (int32 ncols, int32 nrows, float64 metres-per-pixel) followed by
+        row-major float32 heights, north-up -- the same shape as the island-terrain packer
+        in sbg/topo/island_terrain.py. Metres-per-pixel rather than the CRS units so the
+        viewer scales correctly whether the file is 3414 or 4326.
+        """
+        import json
+        import struct
+        import numpy as np
+        import rasterio
+        job = get_job(job_id)
+        if job is None or job.status != "done" or not job.result:
+            raise HTTPException(404, "job not finished")
+        name = job.result.get("dem_filename")
+        if not name:
+            raise HTTPException(404, "this job produced no DEM")
+        p = _job_file(job_id, name)
+        with rasterio.open(p) as ds:
+            z = ds.read(1).astype("<f4")
+        px = 1.0
+        try:
+            px = float(json.loads(p.with_suffix(".json").read_text())["pixel_size_m"])
+        except Exception:
+            pass
+        head = struct.pack("<iid", z.shape[1], z.shape[0], px)
+        return Response(content=head + np.ascontiguousarray(z).tobytes(),
+                        media_type="application/octet-stream")
 
     @app.post("/api/stl/jobs/{job_id}/cancel")
     def stl_cancel(job_id: str):
@@ -283,7 +344,10 @@ def create_app(store_dir=None, dev=False):
         if job is None or job.status != "done" or not job.result:
             raise HTTPException(404, "job not finished")
         job_dir = (STL_JOBS_DIR / job_id).resolve()
-        outputs = job.result.get("outputs") or [job.result]
+        outputs = job.result.get("outputs")
+        if outputs is None:
+            outputs = [job.result]
+        outputs = [o for o in outputs if o.get("stl_path")]
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
@@ -291,6 +355,12 @@ def create_app(store_dir=None, dev=False):
                 stl = Path(o["stl_path"])
                 if stl.is_file():
                     z.write(stl, stl.name)
+                # The raw companion, when the run produced one. It belongs in the SAME
+                # zip as its watertight twin -- keeping the pair together is the whole
+                # point of building them in one run.
+                raw = stl.with_name(stl.stem + ".raw" + stl.suffix)
+                if raw.is_file():
+                    z.write(raw, raw.name)
                 # A wind build writes <stem>.wind.json, any other build writes
                 # <stem>.build.json. Ship whichever exists -- the STL alone carries no
                 # metadata at all, so without its sidecar the domain, the options and
@@ -299,10 +369,25 @@ def create_app(store_dir=None, dev=False):
                     side = stl.with_suffix(suf)
                     if side.is_file():
                         z.write(side, side.name)
+            # The DEM is per-JOB, not per-direction: it is written once in the true world
+            # frame because the geometry is identical for every bearing. So it is added
+            # outside the loop -- adding it per output would write the same file N times.
+            dem_name = job.result.get("dem_filename")
+            if dem_name:
+                for f in (job_dir / dem_name, (job_dir / dem_name).with_suffix(".json")):
+                    if f.is_file():
+                        z.write(f, f.name)
             import json
             z.writestr("manifest.json", json.dumps({
                 "job_id": job_id,
+                # the MESH crs; the DEM carries its own, which may be 4326
                 "crs": "EPSG:3414",
+                "dem": ({"file": job.result["dem_filename"],
+                         "crs": job.result.get("dem_crs"),
+                         "pixel_size_m": job.result.get("dem_px_m"),
+                         "frame": "true world, north-up -- NOT the rotated frame of the "
+                                  "wind STLs; one DEM covers every direction"}
+                        if job.result.get("dem_filename") else None),
                 "created_at": job.created_at,
                 "count": len(outputs),
                 "outputs": [{k: v for k, v in o.items() if k != "stl_path"}
