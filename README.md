@@ -117,70 +117,76 @@ at 1:250,000, so absolute ground is uncertain to roughly ±10 m and no algorithm
 
 ## 3. Running it
 
-### Native
+The whole goal, in order — clone, install, get the data, run:
 
 ```bash
+git clone https://github.com/Wadddllle/quentinsnrsi && cd snrsi
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements-v2.txt     # v2 pipeline + UI (pinned)
-# or requirements-sbg.txt for everything incl. the legacy v1 CityJSON pipeline
+.venv/bin/pip install -r requirements-v2.txt
 ```
 
-Blender is **not required** — meshlib is the default fuse backend for the watertight path
-(see §2). It's only needed if you specifically want `--fuse-backend blender`. If so,
+Then get the data. Two files are required, one is a big optional speed-up:
+
+**Fastest — download the pre-built bundle:** ask quentin he has the ssd. Unzip it so
+`sg_buildings_v5.geojson` lands at the **repo root** (next to this README) and `dtm.tif` +
+`onemap_store/` land under `data/`.
+
+**From scratch instead** (you'll need this eventually anyway, e.g. to refresh with newer
+OneMap data — same commands either way):
+- `sg_buildings_v5.geojson` — an external dataset (NUS City Syntax Lab's buildings.sg), not something
+  this repo generates. Download it from [there](https://github.com/City-Syntax/buildings.sg/blob/main/download/sg_buildings_v5.zip) and place it at the repo root. 
+- `data/dtm.tif` — built from `NationalMapLine.geojson` (634 MB, an SLA/data.gov.sg
+  basemap; download it from [here](https://data.gov.sg/datasets/d_10480c0b59e65663dfae1028ff4aa8bb/view), place it at the **repo root**, then `python -m sbg.topo.contours`
+  extracts `data/contour_points.npz`, and `python -m sbg.topo.dtm` builds `dtm.tif` from
+  that). Only needed if you're not using the bundle — `dtm.tif` itself is small (30 MB) and
+  rarely needs rebuilding, unlike the OneMap-derived files above.
+- `data/onemap_store/` — `python -m sbg.onemap_native.precompute --out data/onemap_store`
+  (crawls every OneMap tile, so it's slow — run `--help` on it for tuning flags). **Optional**:
+  without it the app fetches tiles live per domain instead (~80 s vs ~0.2 s per build), which
+  is fine for occasional use.
+- `data/onemap_buildings.jsonl` — **optional**, only powers the wind/buffer sizing feature.
+  `python -m sbg.onemap.crawl_tiles`.
+
+Then run it:
+
+```bash
+python -m sbg.onemap_native.ui               # web UI at http://localhost:8000
+# or, no browser needed:
+python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl
+```
+
+First UI launch reprojects 118 k footprints (~22 s) and caches the result; later launches
+start in ~6 s. If `sg_buildings_v5.geojson` is missing, startup fails immediately naming the
+exact path it expected — that's the file to go find, not a bug to chase.
+
+Blender is **not required** for any of the above — meshlib is the default fuse backend (see
+§2). It's only relevant if you specifically want `--fuse-backend blender` (§5); if so,
 download the standalone Blender 4.5 LTS tarball (**not** `pip install bpy` — wrong Python
-pin) and point at it:
+pin) and `export SBG_BLENDER_PATH=/path/to/blender-4.5.11-linux-x64/blender`.
 
-```bash
-export SBG_BLENDER_PATH=/path/to/blender-4.5.11-linux-x64/blender
-```
-
-### Docker (the sendable form)
-
-```bash
-docker compose up --build
-# → http://localhost:8000
-```
-
-Blender is **off by default** (meshlib handles both paths). For a build that also supports
-`--fuse-backend blender`:
-
-```bash
-docker build -t sbg --build-arg WITH_BLENDER=1 .
-```
-
-> Build-tested caveat: the Python dependency set, the frontend build, and the Blender
-> tarball URL in the Dockerfile were each verified directly; the full `docker build` was
-> not run on the dev box (no Docker daemon available there). Run it once on a machine with
-> Docker before sending it anywhere.
-
-The image contains **code only**. Two data files are mounted at runtime (see below), and
-OneMap tiles are fetched live per domain — no multi-GB archive needs to travel with it.
-For Podman or Google Cloud Run instead, see [`DEPLOY.md`](DEPLOY.md).
-
-### Runtime data
-
-`data/` is gitignored and won't exist on a fresh clone — the app creates it as needed, but
-you still need to put the two required files somewhere it can find them:
-
-| file | where it goes | size | needed for | how to get it |
-|---|---|---|---|---|
-| `sg_buildings_v5.geojson` | **repo root** (next to this README, *not* under `data/`) | 135 MB | the 2D basemap + in/out preview in the UI | NUS UAL buildings.sg dataset |
-| `data/dtm.tif` | `data/` | 30 MB | terrain elevation (whole island, 20 m) | built once by `sbg/topo/dtm.py` from the SLA contours |
-| `data/onemap_buildings.jsonl` | `data/` | ~200 MB | **optional** — real building-height stats for the wind/buffer sizing UI (`/api/domain/heights`); everything else works without it | `python -m sbg.onemap.crawl_tiles` (a one-time bulk crawl) |
-| `data/onemap_store/` | `data/` | 2.6 GB | **optional** — pre-decoded pieces, makes extraction ~0.2 s instead of ~80 s | `python -m sbg.onemap_native.precompute --local` |
-
-Neither `sg_buildings_v5.geojson` nor `onemap_buildings.jsonl` is needed for a pure CLI
-run — only `dtm.tif` is. The UI needs `sg_buildings_v5.geojson` + `dtm.tif`; the other two
-are pure speed/feature add-ons and the app degrades gracefully without them.
-
-First UI launch reprojects 118 k footprints (~22 s) and caches to
-`data/footprint_index_cache.pkl`; later launches start in ~6 s. If the geojson is missing
-entirely, startup fails immediately with a message naming the exact path it expected —
-that's the file to go find, not a bug to chase.
+To run this in Podman/Docker instead, or host it on Google Cloud Run, see
+[`DEPLOY.md`](DEPLOY.md) — running it natively as above is simpler and faster if that's an
+option for you.
 
 ---
 
-## 4. CLI reference
+## 4. Web UI
+
+```bash
+python -m sbg.onemap_native.ui [--store data/onemap_store] [--port 8000]
+```
+
+Draw a domain (rectangle / polygon / point+buffer) on a 2D map of the whole island, see
+which buildings are kept vs. crossing the boundary, generate the STL as a background job
+with live progress, view it in 3D, download it. Advanced settings expose the build flags
+from §5.
+
+Frontend dev loop: `python -m sbg.onemap_native.ui --dev --port 8011` alongside
+`cd webui-v2 && npm run dev`.
+
+---
+
+## 5. CLI reference
 
 ```bash
 python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl [options]
@@ -205,22 +211,6 @@ flat at ~0.3 % across the whole useful range — that ~0.3 % is the voxel-remesh
 not decimation damage. So you can decimate hard for free; the limit is that `maxError` is a
 real geometric displacement, and once it exceeds your cell size, corners move more than the
 solver can see anyway.
-
----
-
-## 5. Web UI
-
-```bash
-python -m sbg.onemap_native.ui [--store data/onemap_store] [--port 8000]
-```
-
-Draw a domain (rectangle / polygon / point+buffer) on a 2D map of the whole island, see
-which buildings are kept vs. crossing the boundary, generate the STL as a background job
-with live progress, view it in 3D, download it. Advanced settings expose the build flags
-above.
-
-Frontend dev loop: `python -m sbg.onemap_native.ui --dev --port 8011` alongside
-`cd webui-v2 && npm run dev`.
 
 ---
 
