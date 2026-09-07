@@ -110,7 +110,7 @@ const overlays = computed(() => {
 });
 
 // --- power-user build options (whitelisted server-side in _BUILD_OPTS) ---
-const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0, crossing: 'auto', include_raw: false, dem: false, dem_px_m: 4.0, dem_crs: 3414, dem_agg: 'median', dem_overhang: 'keep', dem_supersample: 4, dem_source: 'surface', dem_only: false };
+const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0, crossing: 'auto', include_raw: false, dem: false, dem_px_m: 4.0, dem_crs: 4326, dem_agg: 'median', dem_overhang: 'keep', dem_supersample: 4, dem_source: 'surface', dem_only: false };
 const options = ref({ ...DEFAULT_OPTS });
 const showAdvanced = ref(false);
 // Long-form explanation belongs behind an (i), not printed in the sidebar. This is a

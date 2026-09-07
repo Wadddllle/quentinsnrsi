@@ -31,7 +31,6 @@ what your CFD mesher does with the surface.**
 | Self-intersections | yes (~thousands per domain) | none |
 | Faces (400 m domain) | ~16 k | ~340 k for a 2 km domain; small domains far less |
 | Time (400 m, from store) | **~3 s** | ~40–90 s |
-| Needs Blender | **no** | yes |
 | **Ansys Fluent — fault-tolerant / wrap** | ✅ **this is the intended target** | ✅ |
 | **Ansys Fluent — watertight geometry** | ❌ rejects it (see below) | ✅ |
 | **OpenFOAM snappyHexMesh** | ✅ | ✅ |
@@ -41,7 +40,7 @@ what your CFD mesher does with the surface.**
 Ansys' **fault-tolerant meshing (FTM)** wraps the surface — it shrink-wraps a shell around
 your geometry and never has to resolve the input's own topology. It does not care that the
 raw mesh is open, multi-solid, or self-intersecting. So it accepts full-detail LiDAR
-directly, and you skip the voxel remesh entirely (no Blender, ~30× faster, no detail loss).
+directly, and you skip the voxel remesh entirely (~30× faster, no detail loss).
 
 The cost is memory: FTM's wrap is memory-hungry, and a ~2 km domain of raw geometry needs a
 large workstation. If that's a problem, the watertight path trades detail for a mesh a
@@ -82,9 +81,9 @@ where building meshes interpenetrate the terrain.
  ▼
  ├──── raw ──────────── write terrain + buildings straight to STL. Done.
  │
- └──── watertight ───── Blender: join everything into one soup → voxel remesh
-                        → meshlib: decimate, boolean-clip to the exact domain,
-                        drop debris, polish to strict watertightness
+ └──── watertight ───── join everything into one soup → voxel remesh → decimate,
+                        boolean-clip to the exact domain, drop debris, polish
+                        to strict watertightness
 ```
 
 **Working CRS is EPSG:3414 (SVY21, metres) throughout.** WGS84 only appears at the
@@ -147,40 +146,19 @@ OneMap data — same commands either way):
 - `data/onemap_buildings.jsonl` — **optional**, only powers the wind/buffer sizing feature.
   `.venv/bin/python -m sbg.onemap.crawl_tiles`.
 
-Then run it:
-
-```bash
-.venv/bin/python -m sbg.onemap_native.ui               # web UI at http://localhost:8000
-# or, no browser needed:
-.venv/bin/python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl
-```
-
-First UI launch reprojects 118 k footprints (~22 s) and caches the result; later launches
-start in ~6 s. If `sg_buildings_v5.geojson` is missing, startup fails immediately naming the
-exact path it expected — that's the file to go find, not a bug to chase.
-
-Blender is **not required** for any of the above — meshlib is the default fuse backend (see
-§2). It's only relevant if you specifically want `--fuse-backend blender` (§5); if so,
-download the standalone Blender 4.5 LTS tarball (**not** `pip install bpy` — wrong Python
-pin) and `export SBG_BLENDER_PATH=/path/to/blender-4.5.11-linux-x64/blender`.
-
-To run this in Podman/Docker instead, or host it on Google Cloud Run, see
-[`DEPLOY.md`](DEPLOY.md) — running it natively as above is simpler and faster if that's an
-option for you.
+Then: §4 for the web UI, §5 for the CLI. To run this in Podman/Docker or host it on Google
+Cloud Run instead, see [`DEPLOY.md`](DEPLOY.md).
 
 ---
 
 ## 4. Web UI
 
 ```bash
-.venv/bin/python -m sbg.onemap_native.ui --no-browser
+cd webui-v2 && npm install && npm run build && cd ..
+.venv/bin/python -m sbg.onemap_native.ui
 ```
 
-Add `--store data/onemap_store` if you have the piece store, and/or `--port 8000` to change
-the port (both optional — defaults are live tile fetch and port 8000).
-```bash
-.venv/bin/python -m sbg.onemap_native.ui --no-browser --port 8011 --store data/onemap_store
-```
+Add `--store data/onemap_store` if you downloaded it, `--port 8000` to change the port.
 
 Draw a domain (rectangle / polygon / point+buffer) on a 2D map of the whole island, see
 which buildings are kept vs. crossing the boundary, generate the STL as a background job
@@ -189,6 +167,15 @@ from §5.
 
 Frontend dev loop: `.venv/bin/python -m sbg.onemap_native.ui --dev --port 8011` alongside
 `cd webui-v2 && npm run dev`.
+
+No npm/node yet:
+
+```bash
+sudo apt-get install curl
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | bash
+source ~/.bashrc
+nvm install --lts
+```
 
 ---
 
@@ -205,7 +192,7 @@ always means "optional," never something to type literally — same convention a
 
 | flag | default | what it does |
 |---|---|---|
-| `--voxel-size` | `2.0` | `0` = raw path (no Blender). `>0` = voxel remesh at that resolution. |
+| `--voxel-size` | `2.0` | `0` = raw path. `>0` = voxel remesh at that resolution. |
 | `--decimate-error` | `2.5` | **The quality knob.** Max geometric error (m) decimation may introduce. Tie it to your CFD cell size — at a ~3 m target, 2.5 keeps every vertex inside one cell. |
 | `--target-reduction` | `0.97` | Face-count cap. Deliberately high so `--decimate-error` is the real governor. |
 | `--step` | `5.0` | DTM grid step (m). |
