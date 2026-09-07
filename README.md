@@ -8,13 +8,13 @@ Buildings are **real SLA LiDAR capture** (OneMap 3D Tiles), not extruded boxes. 
 comes from SLA contour data. You give it a bounding box or a polygon; it gives you an STL.
 
 ```bash
-python -m sbg.onemap_native.build --bbox 29041,28858,29241,29058 -o duxton.stl --voxel-size 0
+.venv/bin/python -m sbg.onemap_native.build --bbox 29041,28858,29241,29058 -o duxton.stl --voxel-size 0
 ```
 
 or draw the domain on a map in the browser:
 
 ```bash
-python -m sbg.onemap_native.ui
+.venv/bin/python -m sbg.onemap_native.ui
 ```
 
 ---
@@ -136,23 +136,23 @@ OneMap data — same commands either way):
 - `sg_buildings_v5.geojson` — an external dataset (NUS City Syntax Lab's buildings.sg), not something
   this repo generates. Download it from [there](https://github.com/City-Syntax/buildings.sg/blob/main/download/sg_buildings_v5.zip) and place it at the repo root. 
 - `data/dtm.tif` — built from `NationalMapLine.geojson` (634 MB, an SLA/data.gov.sg
-  basemap; download it from [here](https://data.gov.sg/datasets/d_10480c0b59e65663dfae1028ff4aa8bb/view), place it at the **repo root**, then `python -m sbg.topo.contours`
-  extracts `data/contour_points.npz`, and `python -m sbg.topo.dtm` builds `dtm.tif` from
-  that). Only needed if you're not using the bundle — `dtm.tif` itself is small (30 MB) and
-  rarely needs rebuilding, unlike the OneMap-derived files above.
-- `data/onemap_store/` — `python -m sbg.onemap_native.precompute --out data/onemap_store`
+  basemap; download it from [here](https://data.gov.sg/datasets/d_10480c0b59e65663dfae1028ff4aa8bb/view), place it at the **repo root**, then `.venv/bin/python -m sbg.topo.contours`
+  extracts `data/contour_points.npz`, and `.venv/bin/python -m sbg.topo.dtm` builds `dtm.tif`
+  from that). Only needed if you're not using the bundle — `dtm.tif` itself is small (30 MB)
+  and rarely needs rebuilding, unlike the OneMap-derived files above.
+- `data/onemap_store/` — `.venv/bin/python -m sbg.onemap_native.precompute --out data/onemap_store`
   (crawls every OneMap tile, so it's slow — run `--help` on it for tuning flags). **Optional**:
   without it the app fetches tiles live per domain instead (~80 s vs ~0.2 s per build), which
   is fine for occasional use.
 - `data/onemap_buildings.jsonl` — **optional**, only powers the wind/buffer sizing feature.
-  `python -m sbg.onemap.crawl_tiles`.
+  `.venv/bin/python -m sbg.onemap.crawl_tiles`.
 
 Then run it:
 
 ```bash
-python -m sbg.onemap_native.ui               # web UI at http://localhost:8000
+.venv/bin/python -m sbg.onemap_native.ui               # web UI at http://localhost:8000
 # or, no browser needed:
-python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl
+.venv/bin/python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl
 ```
 
 First UI launch reprojects 118 k footprints (~22 s) and caches the result; later launches
@@ -173,7 +173,13 @@ option for you.
 ## 4. Web UI
 
 ```bash
-python -m sbg.onemap_native.ui [--store data/onemap_store] [--port 8000]
+.venv/bin/python -m sbg.onemap_native.ui --no-browser
+```
+
+Add `--store data/onemap_store` if you have the piece store, and/or `--port 8000` to change
+the port (both optional — defaults are live tile fetch and port 8000).
+```bash
+.venv/bin/python -m sbg.onemap_native.ui --no-browser --port 8011 --store data/onemap_store
 ```
 
 Draw a domain (rectangle / polygon / point+buffer) on a 2D map of the whole island, see
@@ -181,7 +187,7 @@ which buildings are kept vs. crossing the boundary, generate the STL as a backgr
 with live progress, view it in 3D, download it. Advanced settings expose the build flags
 from §5.
 
-Frontend dev loop: `python -m sbg.onemap_native.ui --dev --port 8011` alongside
+Frontend dev loop: `.venv/bin/python -m sbg.onemap_native.ui --dev --port 8011` alongside
 `cd webui-v2 && npm run dev`.
 
 ---
@@ -189,9 +195,13 @@ Frontend dev loop: `python -m sbg.onemap_native.ui --dev --port 8011` alongside
 ## 5. CLI reference
 
 ```bash
-python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl [options]
-python -m sbg.onemap_native.build --domain-geojson domain.geojson -o out.stl [options]
+.venv/bin/python -m sbg.onemap_native.build --bbox xmin,ymin,xmax,ymax -o out.stl
+.venv/bin/python -m sbg.onemap_native.build --domain-geojson domain.geojson -o out.stl
 ```
+
+Both accept the flags below, plus anything else `--help` lists (`[...]` in a usage line
+always means "optional," never something to type literally — same convention argparse's own
+`--help` uses).
 
 | flag | default | what it does |
 |---|---|---|
