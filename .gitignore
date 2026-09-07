@@ -44,6 +44,7 @@ doc/*.pdf
 
 # --- Large / generated datasets (raw downloads, backups, pipeline outputs) ---
 /data/
+/cloud_data/
 /onemap_landmarks/
 /hdb.json
 /sg_buildings_v5.geojson

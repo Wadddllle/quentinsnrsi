@@ -125,8 +125,10 @@ python3.12 -m venv .venv
 # or requirements-sbg.txt for everything incl. the legacy v1 CityJSON pipeline
 ```
 
-Blender is only needed for the watertight path. Download the standalone Blender 4.5 LTS
-tarball (**not** `pip install bpy` — wrong Python pin) and point at it:
+Blender is **not required** — meshlib is the default fuse backend for the watertight path
+(see §2). It's only needed if you specifically want `--fuse-backend blender`. If so,
+download the standalone Blender 4.5 LTS tarball (**not** `pip install bpy` — wrong Python
+pin) and point at it:
 
 ```bash
 export SBG_BLENDER_PATH=/path/to/blender-4.5.11-linux-x64/blender
@@ -139,11 +141,11 @@ docker compose up --build
 # → http://localhost:8000
 ```
 
-Blender is baked into the image, so both paths work out of the box. For a much smaller
-image that can only do the raw path:
+Blender is **off by default** (meshlib handles both paths). For a build that also supports
+`--fuse-backend blender`:
 
 ```bash
-docker build -t sbg --build-arg WITH_BLENDER=0 .
+docker build -t sbg --build-arg WITH_BLENDER=1 .
 ```
 
 > Build-tested caveat: the Python dependency set, the frontend build, and the Blender
@@ -153,19 +155,28 @@ docker build -t sbg --build-arg WITH_BLENDER=0 .
 
 The image contains **code only**. Two data files are mounted at runtime (see below), and
 OneMap tiles are fetched live per domain — no multi-GB archive needs to travel with it.
+For Podman or Google Cloud Run instead, see [`DEPLOY.md`](DEPLOY.md).
 
 ### Runtime data
 
-| file | size | needed for | how to get it |
-|---|---|---|---|
-| `sg_buildings_v5.geojson` | 135 MB | the 2D basemap + in/out preview in the UI | NUS UAL buildings.sg dataset |
-| `data/dtm.tif` | 30 MB | terrain elevation (whole island, 20 m) | built once by `sbg/topo/dtm.py` from the SLA contours |
-| `data/onemap_store/` | 2.6 GB | **optional** — pre-decoded pieces, makes extraction ~0.2 s instead of ~80 s | `python -m sbg.onemap_native.precompute --local` |
+`data/` is gitignored and won't exist on a fresh clone — the app creates it as needed, but
+you still need to put the two required files somewhere it can find them:
 
-Neither of the first two is needed for a pure CLI run except `dtm.tif`. The UI needs both.
+| file | where it goes | size | needed for | how to get it |
+|---|---|---|---|---|
+| `sg_buildings_v5.geojson` | **repo root** (next to this README, *not* under `data/`) | 135 MB | the 2D basemap + in/out preview in the UI | NUS UAL buildings.sg dataset |
+| `data/dtm.tif` | `data/` | 30 MB | terrain elevation (whole island, 20 m) | built once by `sbg/topo/dtm.py` from the SLA contours |
+| `data/onemap_buildings.jsonl` | `data/` | ~200 MB | **optional** — real building-height stats for the wind/buffer sizing UI (`/api/domain/heights`); everything else works without it | `python -m sbg.onemap.crawl_tiles` (a one-time bulk crawl) |
+| `data/onemap_store/` | `data/` | 2.6 GB | **optional** — pre-decoded pieces, makes extraction ~0.2 s instead of ~80 s | `python -m sbg.onemap_native.precompute --local` |
+
+Neither `sg_buildings_v5.geojson` nor `onemap_buildings.jsonl` is needed for a pure CLI
+run — only `dtm.tif` is. The UI needs `sg_buildings_v5.geojson` + `dtm.tif`; the other two
+are pure speed/feature add-ons and the app degrades gracefully without them.
 
 First UI launch reprojects 118 k footprints (~22 s) and caches to
-`data/footprint_index_cache.pkl`; later launches start in ~6 s.
+`data/footprint_index_cache.pkl`; later launches start in ~6 s. If the geojson is missing
+entirely, startup fails immediately with a message naming the exact path it expected —
+that's the file to go find, not a bug to chase.
 
 ---
 
@@ -185,6 +196,7 @@ python -m sbg.onemap_native.build --domain-geojson domain.geojson -o out.stl [op
 | `--placement` | `drape` | `group` / `drape` / `laplacian` — how connected structures spanning relief are levelled. |
 | `--coupling-lambda` | `10` | `laplacian` only. Higher = flatter, lower = more terracing. |
 | `--no-base` | off | Exclude the ground plane from the export (buildings only), for solvers that build their own enclosure. Terrain still backs the remesh internally. |
+| `--fuse-backend` | `meshlib` | `meshlib` (no Blender needed) or `blender` (needs `SBG_BLENDER_PATH`) for the voxel-remesh fuse step. Equivalent output; meshlib is ~4× faster. |
 | `--store` | live fetch | Use a precomputed piece store. |
 | `--workers` | `6` | Parallel tile-decode workers (live fetch only). |
 

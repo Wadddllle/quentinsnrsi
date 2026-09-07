@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from shapely.geometry import Polygon, box
 
-from sbg.config import DATA_DIR
+from sbg.config import DATA_DIR, SG_BUILDINGS_GEOJSON
 from sbg.onemap.client import search_buildings
 from sbg.onemap_native.ui.footprints import load_footprint_index
 from sbg.onemap_native.ui.stl_job import run_stl_job
@@ -139,7 +139,18 @@ def _job_file(job_id, name):
 def create_app(store_dir=None, dev=False):
     @asynccontextmanager
     async def lifespan(app):
-        app.state.footprints = load_footprint_index()
+        try:
+            app.state.footprints = load_footprint_index()
+        except FileNotFoundError as e:
+            # The one file this startup actually touches. A bare FileNotFoundError here
+            # reads as "something's broken"; naming the exact missing path and where it
+            # goes is the difference between that and a two-second fix.
+            raise RuntimeError(
+                f"sg_buildings_v5.geojson not found at {SG_BUILDINGS_GEOJSON} "
+                "(repo root, next to README.md and Dockerfile -- NOT under data/). "
+                "Download it (NUS UAL buildings.sg dataset) and place it there, then "
+                "restart. See README.md 'Runtime data'."
+            ) from e
         app.state.store_dir = str(store_dir) if store_dir else None
         print(f"[v2] ready (store={'yes' if store_dir else 'live-fetch'})", flush=True)
         yield

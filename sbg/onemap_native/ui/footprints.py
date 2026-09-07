@@ -126,6 +126,7 @@ def load_footprint_index(path=SG_BUILDINGS_GEOJSON, cache=_CACHE, log=print):
     else:
         records = _build_records(path, log)
         if cache:
+            Path(cache).parent.mkdir(parents=True, exist_ok=True)
             with open(cache, "wb") as f:
                 pickle.dump(records, f, protocol=pickle.HIGHEST_PROTOCOL)
             log(f"[footprints] cached -> {cache}")

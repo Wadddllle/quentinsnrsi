@@ -8,6 +8,13 @@ onemap_landmarks/
 *.city.json
 hdb.json
 
+# Exception: the Dockerfile's `cloud-run` target (see DEPLOY.md) bakes runtime
+# data in instead of mounting it, since Cloud Run has no bind-mount concept.
+# It reads from this separate staging dir, not `data/` -- a parent directory
+# that's excluded above can't be selectively un-excluded, so this has to be a
+# directory of its own rather than a `!data/dtm.tif`-style exception.
+!cloud_data/**
+
 # Vendored reference repos (own .git, not part of this project's code)
 ninja/
 onemap-slicer/

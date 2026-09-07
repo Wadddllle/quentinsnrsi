@@ -3,9 +3,10 @@ services:
     build:
       context: .
       args:
-        # 0 = slim image, raw (--voxel-size 0) path only. 1 = + Blender, so the
-        # watertight path works too.
-        WITH_BLENDER: "1"
+        # 0 = slim image, meshlib fuse backend only (the default -- watertight
+        # path works fine, no Blender needed). 1 = + Blender, for
+        # --fuse-backend blender specifically.
+        WITH_BLENDER: "0"
     image: sbg:latest
     ports:
       - "8000:8000"

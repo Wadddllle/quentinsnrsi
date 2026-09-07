@@ -27,10 +27,12 @@ fastapi
 uvicorn
 orjson
 python-multipart
+ijson==3.5.0
 
 # --- v1 CityJSON pipeline only ---
 cjio                   # `cjio export obj` subprocess in sbg/ui/pipeline.py
-ijson                  # streaming parse of the 634MB NationalMapLine.geojson
+# ijson also serves streaming parse of the 634MB NationalMapLine.geojson here --
+# already pinned above, one entry covers both uses.
 
 # --- optional / diagnostics ---
 opencv-python-headless # cv2.fillPoly pad rasterization (terrain.py; matplotlib fallback)
