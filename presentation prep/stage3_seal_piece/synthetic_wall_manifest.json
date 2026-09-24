@@ -1,0 +1,64 @@
+{
+  "voxel_size_m": 2.0,
+  "wall_length_m": 40.0,
+  "wall_height_m": 20.0,
+  "half_voxel_m": 1.0,
+  "results": [
+    {
+      "thickness_m": 2.0,
+      "true_volume_m3": 1600.0,
+      "remeshed_volume_m3": 1312.500424994367,
+      "pct_recovered": 82.03127656214794,
+      "bodies": 1,
+      "faces": 1052
+    },
+    {
+      "thickness_m": 1.5,
+      "true_volume_m3": 1200.0,
+      "remeshed_volume_m3": 984.3753204127188,
+      "pct_recovered": 82.03127670105991,
+      "bodies": 1,
+      "faces": 1052
+    },
+    {
+      "thickness_m": 1.0,
+      "true_volume_m3": 800.0,
+      "remeshed_volume_m3": 656.2503057618969,
+      "pct_recovered": 82.03128822023712,
+      "bodies": 1,
+      "faces": 1052
+    },
+    {
+      "thickness_m": 0.75,
+      "true_volume_m3": 600.0,
+      "remeshed_volume_m3": 492.18788188123136,
+      "pct_recovered": 82.0313136468719,
+      "bodies": 1,
+      "faces": 1052
+    },
+    {
+      "thickness_m": 0.5,
+      "true_volume_m3": 400.0,
+      "remeshed_volume_m3": 328.12537519113755,
+      "pct_recovered": 82.03134379778439,
+      "bodies": 1,
+      "faces": 1052
+    },
+    {
+      "thickness_m": 0.25,
+      "true_volume_m3": 200.0,
+      "remeshed_volume_m3": 164.06287119074338,
+      "pct_recovered": 82.03143559537169,
+      "bodies": 1,
+      "faces": 1052
+    },
+    {
+      "thickness_m": 0.1,
+      "true_volume_m3": 80.0,
+      "remeshed_volume_m3": 65.62530650702006,
+      "pct_recovered": 82.03163313377507,
+      "bodies": 1,
+      "faces": 1052
+    }
+  ]
+}

@@ -1,0 +1,97 @@
+                                %%%%%%%%%%%%%%%
+                           %%%%%%%%%%%%%%%%%%%%%%%%
+                        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                      %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                                    %%%%%%%%%%%%%%%%%%%%%%%%
+                                     %%%%%%%%%%%%%%%%%%%%%%%%
+                 ###############      %%%%%%%%%%%%%%%%%%%%%%%%
+                ##################     %%%%%%%%%%%%%%%%%%%%%%%
+                ###################     %%%%%%%%%%%%%%%%%%%%%%%
+                ####################     %%%%%%%%%%%%%%%%%%%%%%
+                #####################     %%%%%%%%%%%%%%%%%%%%%
+                ######################     %%%%%%%%%%%%%%%%%%%%
+                #######################     %%%%%%%%%%%%%%%%%%
+                 #######################     %%%%%%%%%%%%%%%%%
+                 ######################     %%%%%%%%%%%%%%%%%
+                  ####################     %%%%%%%%%%%%%%%%%
+                    #################     %%%%%%%%%%%%%%%%%
+                     ###############     %%%%%%%%%%%%%%%%
+                       ############     %%%%%%%%%%%%%%%
+                          ########     %%%%%%%%%%%%%%
+                                      %%%%%%%%%%%
+
+                 | The OpenMC Monte Carlo Code
+       Copyright | 2011-2025 MIT, UChicago Argonne LLC, and contributors
+         License | https://docs.openmc.org/en/latest/license.html
+         Version | 0.15.3
+     Commit Hash | 27e38e894697bb32a1dac7848d2618818b6b8daf
+       Date/Time | 2026-09-23 17:23:40
+   MPI Processes | 1
+  OpenMP Threads | 12
+
+ Reading settings XML file...
+ Reading cross sections XML file...
+ Reading materials XML file...
+ Reading geometry XML file...
+ Reading C0 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_C0.h5
+ Reading C from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_C.h5 
+ Reading N14 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_N14.h5
+ Reading N from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_N.h5 
+ Reading N15 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_N15.h5
+ Reading O16 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_O16.h5
+ Reading O from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_O.h5 
+ Reading O17 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_O17.h5
+ Reading Ar36 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_Ar36.h5
+ WARNING: Negative value(s) found on probability table for nuclide Ar36 at 294K
+ Reading Ar from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_Ar.h5 
+ Reading Ar38 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_Ar38.h5
+ Reading Ar40 from /home/quentin/nuclear_data/ENDFB-7.1-NNDC_Ar40.h5
+ Minimum neutron data temperature: 294 K
+ Maximum neutron data temperature: 294 K
+ Reading tallies XML file...
+ WARNING: Mesh with ID=1 appears in multiple files.
+ Preparing distributed cell instances...
+ Reading plot XML file...
+ Writing summary.h5 file...
+ Maximum neutron transport energy: 20000000 eV for N15
+
+ ===============>     FIXED SOURCE TRANSPORT SIMULATION     <===============
+
+ Simulating batch 1
+ Simulating batch 2
+ Simulating batch 3
+ Simulating batch 4
+ Simulating batch 5
+ Simulating batch 6
+ Simulating batch 7
+ Simulating batch 8
+ Simulating batch 9
+ Simulating batch 10
+ Creating state point statepoint.10.h5...
+
+ =======================>     TIMING STATISTICS     <=======================
+
+ Total time for initialization     = 1.8681e+00 seconds
+   Reading cross sections          = 2.9325e-01 seconds
+ Total time in simulation          = 4.2319e+03 seconds
+   Time in transport only          = 4.2309e+03 seconds
+   Time in active batches          = 4.2319e+03 seconds
+   Time accumulating tallies       = 1.3656e-01 seconds
+   Time writing statepoints        = 9.0379e-01 seconds
+ Total time for finalization       = 2.8910e+01 seconds
+ Total time elapsed                = 4.2629e+03 seconds
+ Calculation Rate (active)         = 118149 particles/second
+
+ ============================>     RESULTS     <============================
+
+ Leakage Fraction            = 0.01938 +/- 0.00001
+
+loaded /home/quentin/snrsi/kelvins_0penmc/conc.npy: shape (z,y,x)=(70, 350, 300), nonzero=1184/7350000
+Ar-41 gamma spectrum: 5 lines, total yield 0.992124 photons/decay (source: chain_endf_b8.1.xml)
+total activity: 1.099272e+12 Bq, photons/s: 1.090615e+12
+
+wrote XML to /home/quentin/snrsi/kelvins_0penmc/openmc_run/
+
+=== openmc ===

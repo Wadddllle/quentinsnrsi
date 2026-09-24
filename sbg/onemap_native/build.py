@@ -738,12 +738,14 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
     # Fail before doing 30s of work, not after. include_base=False puts every building on a
     # common z=0 datum with no terrain at all (see the FLAT-GROUND branch below), so a
     # terrain raster there would be neither ground nor buildings-at-their-real-elevation --
-    # it would be a plausible-looking lie. Refuse rather than emit one.
-    if dem and not include_base:
+    # it would be a plausible-looking lie. Refuse rather than emit one. The one exception is
+    # dem_source="buildings": that source never touches terrain at all (see dem.py's
+    # need_terrain), so it is meaningful even with no terrain built.
+    if dem and not include_base and dem_source != "buildings":
         raise ValueError("--dem needs terrain, but include_base=False is the flat-ground "
                          "mode: buildings sit on a common z=0 datum and no terrain is built, "
-                         "so a height raster would be meaningless. Drop --no-base, or build "
-                         "the DEM from a separate run.")
+                         "so a height raster would be meaningless. Drop --no-base, use "
+                         "--dem-source buildings, or build the DEM from a separate run.")
     if dem:
         from sbg.onemap_native import dem as _demmod
         if dem_agg not in _demmod.AGGS:
@@ -753,6 +755,8 @@ def build_domain_stl(domain_polygon, out_stl, step=5.0, voxel_size=2.0,
                              f"got {dem_overhang!r}")
         if int(dem_crs) not in _demmod.CRS_CHOICES:
             raise ValueError(f"dem_crs must be one of {_demmod.CRS_CHOICES}, got {dem_crs!r}")
+        if dem_source not in _demmod.SOURCES:
+            raise ValueError(f"dem_source must be one of {_demmod.SOURCES}, got {dem_source!r}")
         if not (dem_px_m and float(dem_px_m) > 0):
             raise ValueError(f"dem_px_m must be > 0, got {dem_px_m!r}")
 
@@ -1234,9 +1238,13 @@ def main():
     ap.add_argument("--dem-supersample", type=int, default=4, dest="dem_supersample",
                     help="samples per pixel axis (default 4, i.e. 16 per pixel). 1 = plain "
                          "pixel-centre sampling, which drops sub-pixel structure entirely.")
-    ap.add_argument("--dem-source", default="surface", choices=("surface", "terrain"),
+    ap.add_argument("--dem-source", default="surface",
+                    choices=("surface", "terrain", "terrain_raw", "buildings"),
                     help="'surface' = terrain with buildings (a DSM, the default); "
-                         "'terrain' = bare ground as built, including the graded pads.")
+                         "'terrain' = bare ground as built, including the graded pads; "
+                         "'terrain_raw' = the whole-island DTM sampled directly, no pads, "
+                         "no grading (native 20 m); 'buildings' = building heights only, "
+                         "nodata elsewhere -- the only source usable with --no-base.")
     args = ap.parse_args()
 
     domain = load_domain_polygon(bbox=args.bbox, domain_geojson=args.domain_geojson,

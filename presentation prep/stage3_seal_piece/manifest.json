@@ -1,0 +1,60 @@
+{
+  "step0_raw": {
+    "verts": 17330,
+    "faces": 5802,
+    "boundary_edges": 17330,
+    "nonmanifold_edges": 0,
+    "bodies": 5764
+  },
+  "step1_welded": {
+    "verts": 1508,
+    "faces": 5802,
+    "boundary_edges": 0,
+    "nonmanifold_edges": 4288,
+    "bodies": 1
+  },
+  "step2_deduped": {
+    "verts": 1508,
+    "faces": 2898,
+    "boundary_edges": 126,
+    "nonmanifold_edges": 0,
+    "bodies": 1
+  },
+  "step3_winding_fixed": {
+    "verts": 1508,
+    "faces": 2898,
+    "boundary_edges": 126,
+    "nonmanifold_edges": 0,
+    "bodies": 1
+  },
+  "step4_sealed": {
+    "verts": 1508,
+    "faces": 3016,
+    "boundary_edges": 0,
+    "nonmanifold_edges": 0,
+    "bodies": 1
+  },
+  "_meta": {
+    "picked_piece_bbox_diag_m": 241.17352294921875,
+    "sealed_volume_m3": 497722.6587728777,
+    "replay_matches_seal_piece": true,
+    "domain_center_svy21": [
+      22564.8,
+      30648.98
+    ]
+  },
+  "without_sealing_voxel_remesh_1m": {
+    "remesh_raw_unsealed": {
+      "verts": 19370,
+      "faces": 37616,
+      "bodies": 297,
+      "volume_m3": 2516.6428206336373
+    },
+    "remesh_sealed": {
+      "verts": 66490,
+      "faces": 132984,
+      "bodies": 1,
+      "volume_m3": 499628.1261868477
+    }
+  }
+}

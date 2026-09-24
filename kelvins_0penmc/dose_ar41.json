@@ -1,0 +1,66 @@
+{
+  "unit": "nSv/s",
+  "scale_sv_per_s_per_unit": 1e-09,
+  "source_run_dir": "/home/quentin/snrsi/kelvins_0penmc/openmc_run",
+  "statepoint": "/home/quentin/snrsi/kelvins_0penmc/openmc_run/statepoint.10.h5",
+  "n_batches": 10,
+  "n_particles": 50000000,
+  "max_relative_error": 1.0000000000000002,
+  "mean_relative_error": 0.2054587580177149,
+  "nonzero_tally_cells": 7179453,
+  "grid_shape_zyx": [
+    70,
+    350,
+    300
+  ],
+  "upstream_meta": {
+    "nuclide": "Ar41",
+    "decay_data_source": "/home/quentin/snrsi/.venv/lib/python3.12/site-packages/openmc_data/depletion/chain_endf_b8.1.xml",
+    "half_life_s": 6576.6,
+    "gamma_lines_eV": [
+      3311.0,
+      3314.0,
+      3590.0,
+      1293640.0,
+      1677000.0
+    ],
+    "gamma_intensities_per_decay": [
+      2.711828e-06,
+      5.360589e-06,
+      7.504825e-07,
+      0.9916,
+      0.000515632
+    ],
+    "total_gamma_yield_per_decay": 0.9921244548995001,
+    "total_activity_bq": 1099272177628.9062,
+    "photons_per_s": 1090614810016.265,
+    "dose_coefficients": {
+      "particle": "photon",
+      "geometry": "AP",
+      "data_source": "icrp116"
+    },
+    "particle_scored": "photon (gamma dose only, no beta/electron scoring)",
+    "grid_shape_zyx": [
+      70,
+      350,
+      300
+    ],
+    "cell_size_m": 10.0,
+    "margin_m": 400.0,
+    "tally_cell_cm3": 1000000000.0,
+    "batches": 10,
+    "particles": 50000000,
+    "inputs": {
+      "conc": {
+        "path": "/home/quentin/snrsi/kelvins_0penmc/conc.npy",
+        "sha256": "e9e71a94d10c321a951970034699e68c19df8d0705aa0b21801dd2cfcbe90aff",
+        "bytes": 58800128
+      },
+      "chain": {
+        "path": "/home/quentin/snrsi/.venv/lib/python3.12/site-packages/openmc_data/depletion/chain_endf_b8.1.xml",
+        "sha256": "acbc5f9cd454361fc49462d6ad28d6881cf16070ee917c53b9b8e587e0a5bdc6",
+        "bytes": 27666690
+      }
+    }
+  }
+}

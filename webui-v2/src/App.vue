@@ -110,7 +110,7 @@ const overlays = computed(() => {
 });
 
 // --- power-user build options (whitelisted server-side in _BUILD_OPTS) ---
-const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0, crossing: 'auto', include_raw: false, dem: false, dem_px_m: 4.0, dem_crs: 4326, dem_agg: 'median', dem_overhang: 'keep', dem_supersample: 4, dem_source: 'surface', dem_only: false };
+const DEFAULT_OPTS = { voxel_size: 2.0, decimate_error: 2.5, target_reduction: 0.97, workers: 6, include_base: true, placement: 'drape', coupling_lambda: 10.0, crossing: 'auto', include_raw: false, dem: false, dem_px_m: 4.0, dem_crs: 3414, dem_agg: 'median', dem_overhang: 'keep', dem_supersample: 4, dem_source: 'surface', dem_only: false };
 const options = ref({ ...DEFAULT_OPTS });
 const showAdvanced = ref(false);
 // Long-form explanation belongs behind an (i), not printed in the sidebar. This is a
@@ -890,7 +890,7 @@ watch(logTail, () => {
               </template>
             </small>
           </label>
-          <label>Overhangs
+          <label v-if="options.dem_source === 'surface'">Overhangs
             <select v-model="options.dem_overhang">
               <option value="keep">Fill the column (default)</option>
               <option value="drop">Report ground height</option>
@@ -903,10 +903,31 @@ watch(logTail, () => {
           <label>Contents
             <select v-model="options.dem_source">
               <option value="surface">Surface — ground and buildings (default)</option>
-              <option value="terrain">Ground only</option>
+              <option value="terrain">Ground only — as graded (pads included)</option>
+              <option value="terrain_raw">Ground only — raw DTM (no pads)</option>
+              <option value="buildings">Buildings only</option>
             </select>
-            <small class="muted">Ground only still includes the graded pads the buildings
-              sit on, not the raw island DTM.</small>
+            <small class="muted">
+              <template v-if="options.dem_source === 'terrain'">
+                The terrain solid this domain was actually built on — building footprints
+                are flattened into graded pads first, so the ground under every building
+                reads as level, not its original slope.
+              </template>
+              <template v-else-if="options.dem_source === 'terrain_raw'">
+                Sampled straight from the whole-island DTM, bypassing the built terrain
+                solid entirely — no grading, no pads. What the ground looked like before
+                this domain was built, at the DTM's native 20 m (finer pixel sizes above
+                just interpolate it).
+              </template>
+              <template v-else-if="options.dem_source === 'buildings'">
+                Building heights only. Pixels with no building are nodata, not filled from
+                terrain or the DTM — a footprint-and-height raster of the buildings alone.
+                The only Contents option that works with terrain excluded.
+              </template>
+              <template v-else>
+                Ground and buildings combined into one surface — a DSM.
+              </template>
+            </small>
           </label>
         </template>
         <div class="row modal-actions">

@@ -57,6 +57,8 @@ default matters for a given domain.
 Standalone use (a DEM from an STL already on disk, no rebuild):
     .venv/bin/python -m sbg.onemap_native.dem domain.raw.stl -o dem.tif --px 4
 """
+import warnings
+
 import numpy as np
 from affine import Affine
 
@@ -73,9 +75,22 @@ AGGS = tuple(_AGG_PCT) + ("mean",)
 OVERHANGS = ("keep", "drop")
 CRS_CHOICES = (3414, 4326)
 
-# GeoTIFF nodata sentinel. Never actually appears when outside-the-domain pixels are filled
-# from the island DTM (the default), but it is declared so a reader has one.
-NODATA = -9999.0
+# What one pixel's height is sampled FROM:
+#   surface      -- terrain (graded, with pads) + buildings on top. A DSM. Default.
+#   terrain      -- the built terrain solid alone: graded, pads included, no buildings.
+#   terrain_raw  -- the whole-island DTM sampled directly, bypassing the built terrain
+#                   solid entirely: no grading, no pads, no plunge skirts. What the ground
+#                   looked like before this domain was built, at the DTM's native 20 m.
+#   buildings    -- building geometry alone. Pixels with no building are true nodata (the
+#                   NODATA sentinel), not filled from terrain or the island DTM -- this is
+#                   a footprint-and-height raster of the buildings, nothing else.
+SOURCES = ("surface", "terrain", "terrain_raw", "buildings")
+
+# GeoTIFF nodata sentinel. Never actually appears for a ground/surface source, since
+# outside-the-domain pixels are always filled from the island DTM -- but it is declared so a
+# reader has one, and it genuinely appears for `source="buildings"`, where a pixel with no
+# building really is a hole (see the SOURCES docstring above).
+NODATA = 0
 
 
 # --------------------------------------------------------------------------------------
@@ -183,27 +198,35 @@ def _reduce(sub, k, agg, row_block=256):
 
     Blocked over rows: the intermediate is (rows, ncols, k*k), which at k=4 on a large
     domain would otherwise be a few hundred MB in one allocation.
+
+    NaN-aware throughout (nanmean/nanmax/nanmin/nanpercentile): harmless when `sub` has no
+    NaN (every other source), and required for `source="buildings"`, where a pixel with
+    zero building coverage is a genuine hole that must survive the collapse as NaN rather
+    than contaminate -- or be silently smoothed into -- its neighbours. An all-NaN block
+    correctly reduces to NaN; the warning that raises is expected there, not a bug.
     """
     nrows, ncols = sub.shape[0] // k, sub.shape[1] // k
     out = np.empty((nrows, ncols), dtype=np.float64)
     pct = None if agg == "mean" else _AGG_PCT[agg]
-    for a in range(0, nrows, row_block):
-        b = min(nrows, a + row_block)
-        blk = (sub[a * k:b * k, :]
-               .reshape(b - a, k, ncols, k).transpose(0, 2, 1, 3).reshape(b - a, ncols, k * k))
-        if agg == "mean":
-            out[a:b] = blk.mean(axis=2)
-        elif pct == 100.0:
-            out[a:b] = blk.max(axis=2)
-        elif pct == 0.0:
-            out[a:b] = blk.min(axis=2)
-        else:
-            # method="nearest", NOT the default linear interpolation. A cell that is exactly
-            # half roof and half ground would otherwise average to a height that exists
-            # nowhere -- mid-air, halfway up the wall -- which is precisely the `mean`
-            # pathology this reduction exists to avoid. Every output height must be a height
-            # something in the mesh actually has.
-            out[a:b] = np.percentile(blk, pct, axis=2, method="nearest")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        for a in range(0, nrows, row_block):
+            b = min(nrows, a + row_block)
+            blk = (sub[a * k:b * k, :]
+                   .reshape(b - a, k, ncols, k).transpose(0, 2, 1, 3).reshape(b - a, ncols, k * k))
+            if agg == "mean":
+                out[a:b] = np.nanmean(blk, axis=2)
+            elif pct == 100.0:
+                out[a:b] = np.nanmax(blk, axis=2)
+            elif pct == 0.0:
+                out[a:b] = np.nanmin(blk, axis=2)
+            else:
+                # method="nearest", NOT the default linear interpolation. A cell that is
+                # exactly half roof and half ground would otherwise average to a height
+                # that exists nowhere -- mid-air, halfway up the wall -- which is precisely
+                # the `mean` pathology this reduction exists to avoid. Every output height
+                # must be a height something in the mesh actually has.
+                out[a:b] = np.nanpercentile(blk, pct, axis=2, method="nearest")
     return out
 
 
@@ -240,8 +263,12 @@ def build_dem(terr_v, terr_f, bld_v, bld_f, domain_polygon, dtm, *, px_m=4.0, cr
         raise ValueError(f"dem_overhang must be one of {OVERHANGS}, got {overhang!r}")
     if int(crs) not in CRS_CHOICES:
         raise ValueError(f"dem_crs must be one of {CRS_CHOICES}, got {crs!r}")
+    if source not in SOURCES:
+        raise ValueError(f"dem_source must be one of {SOURCES}, got {source!r}")
     k = max(1, int(supersample))
     crs = int(crs)
+    need_terrain = source != "buildings"
+    need_buildings = source in ("surface", "buildings")
 
     terr_v = np.asarray(terr_v, dtype=np.float64).reshape(-1, 3)
     bld_v = np.asarray(bld_v, dtype=np.float64).reshape(-1, 3)
@@ -254,10 +281,10 @@ def build_dem(terr_v, terr_f, bld_v, bld_f, domain_polygon, dtm, *, px_m=4.0, cr
         from pyproj import Transformer
         fwd = Transformer.from_crs("EPSG:3414", "EPSG:4326", always_xy=True)
         to_svy = Transformer.from_crs("EPSG:4326", "EPSG:3414", always_xy=True)
-        if len(terr_v):
+        if need_terrain and len(terr_v):
             terr_v = terr_v.copy()
             terr_v[:, 0], terr_v[:, 1] = fwd.transform(terr_v[:, 0], terr_v[:, 1])
-        if len(bld_v):
+        if need_buildings and len(bld_v):
             bld_v = bld_v.copy()
             bld_v[:, 0], bld_v[:, 1] = fwd.transform(bld_v[:, 0], bld_v[:, 1])
         ring = np.asarray(domain_polygon.exterior.coords, dtype=np.float64)[:, :2]
@@ -281,52 +308,84 @@ def build_dem(terr_v, terr_f, bld_v, bld_f, domain_polygon, dtm, *, px_m=4.0, cr
     sub_shape = (nrows * k, ncols * k)
     sub_affine = Affine(affine.a / k, 0.0, affine.c, 0.0, affine.e / k, affine.f)
 
-    terr_top, _ = rasterize_z(terr_v, terr_f, sub_affine, sub_shape)
-    bld_top, bld_bot = rasterize_z(bld_v, bld_f, sub_affine, sub_shape, want_min=True)
-
-    # fill everything the terrain mesh does not cover from the island DTM
-    miss = ~np.isfinite(terr_top)
-    n_missing = int(miss.sum())
-    if n_missing:
-        mr, mc = np.nonzero(miss)
-        wx = sub_affine.c + (mc + 0.5) * sub_affine.a
-        wy = sub_affine.f + (mr + 0.5) * sub_affine.e
+    # TERRAIN: two different sources depending on `source`, never both.
+    #   terrain_raw skips the built (graded/padded) terrain solid entirely and samples the
+    #   whole-island DTM directly at every pixel centre -- no grading, no pads, no plunge
+    #   skirts, the ground as it was before this domain was built.
+    #   Otherwise, rasterise the built terrain solid and fill whatever it does not cover
+    #   (the corners a north-up raster necessarily has over a rotated/non-rectangular
+    #   domain) from the same island DTM -- that IS real terrain, just outside the domain.
+    n_missing = 0
+    if not need_terrain:
+        terr_top = None
+    elif source == "terrain_raw":
+        mr, mc = np.indices(sub_shape)
+        wx = sub_affine.c + (mc.ravel() + 0.5) * sub_affine.a
+        wy = sub_affine.f + (mr.ravel() + 0.5) * sub_affine.e
         if to_svy is not None:
             wx, wy = to_svy.transform(wx, wy)
-        terr_top[mr, mc] = dtm(np.asarray(wx), np.asarray(wy))
+        terr_top = dtm(np.asarray(wx), np.asarray(wy)).reshape(sub_shape)
+    else:
+        terr_top, _ = rasterize_z(terr_v, terr_f, sub_affine, sub_shape)
+        miss = ~np.isfinite(terr_top)
+        n_missing = int(miss.sum())
+        if n_missing:
+            mr, mc = np.nonzero(miss)
+            wx = sub_affine.c + (mc + 0.5) * sub_affine.a
+            wy = sub_affine.f + (mr + 0.5) * sub_affine.e
+            if to_svy is not None:
+                wx, wy = to_svy.transform(wx, wy)
+            terr_top[mr, mc] = dtm(np.asarray(wx), np.asarray(wy))
 
-    bld_cov = np.isfinite(bld_top)
-    overh = bld_cov & ((bld_bot - terr_top) > OVERHANG_M)
+    # BUILDINGS: only rasterised when the source actually needs them, so a pure-ground
+    # export pays nothing for building triangle count.
+    if need_buildings:
+        bld_top, bld_bot = rasterize_z(bld_v, bld_f, sub_affine, sub_shape, want_min=True)
+        bld_cov = np.isfinite(bld_top)
+    else:
+        bld_top = bld_bot = None
+        bld_cov = np.zeros(sub_shape, dtype=bool)
+
+    overh = (bld_cov & ((bld_bot - terr_top) > OVERHANG_M)
+             if (need_buildings and need_terrain) else np.zeros(sub_shape, dtype=bool))
     n_over = int(overh.sum())
 
-    if source == "terrain":
+    if source == "buildings":
+        # True holes, not a bogus ground-level height: a pixel with no building here is
+        # NODATA, because there is nothing else in this raster to report for it.
+        surface = np.where(bld_cov, bld_top, np.nan)
+    elif not need_buildings:                                 # terrain / terrain_raw
         surface = terr_top
-    else:
+    else:                                                    # surface
         surface = terr_top.copy()
         use = bld_cov & (~overh) if overhang == "drop" else bld_cov
         surface[use] = np.maximum(bld_top[use], terr_top[use])
 
     out = _reduce(surface, k, agg)
-    ground = _reduce(terr_top, k, agg)
 
-    # The number that settles whether `agg` matters here: implied building volume under the
-    # chosen reduction vs under max. If they agree, the default is irrelevant for this
-    # domain; if max is far higher, that is the half-pixel dilation, measured.
-    cell = px_m * px_m
-    vol = float(np.clip(out - ground, 0, None).sum() * cell)
-    vol_max = float(np.clip(_reduce(surface, k, "max") - ground, 0, None).sum() * cell)
-    over_frac = n_over / max(1, bld_cov.sum())
+    # The implied-volume self-check only means something when both a ground and a building
+    # surface exist to compare -- i.e. `source="surface"` exactly.
+    if source == "surface":
+        ground = _reduce(terr_top, k, agg)
+        cell = px_m * px_m
+        vol = float(np.clip(out - ground, 0, None).sum() * cell)
+        vol_max = float(np.clip(_reduce(surface, k, "max") - ground, 0, None).sum() * cell)
+    else:
+        vol = vol_max = 0.0
+    over_frac = n_over / max(1, bld_cov.sum()) if need_buildings else 0.0
 
-    log(f"[dem] {ncols}x{nrows} @ {px_m:g} m, EPSG:{crs}, agg={agg}, {k}x{k} subsamples")
-    # Only meaningful when there ARE buildings: with none (dem_source=terrain, or the
-    # standalone CLI, which has no terrain/building split) this compares terrain to itself
-    # and both numbers are 0, which reads as a bug rather than as "not applicable".
-    if int(bld_cov.sum()) and source == "surface":
+    log(f"[dem] {ncols}x{nrows} @ {px_m:g} m, EPSG:{crs}, source={source}, agg={agg}, "
+        f"{k}x{k} subsamples")
+    if source == "surface":
         log(f"[dem] implied building volume {vol:,.0f} m^3 (agg={agg}) vs {vol_max:,.0f} "
             f"m^3 (agg=max, {(vol_max / vol - 1) * 100 if vol > 0 else 0:+.1f}%)")
         log(f"[dem] overhang columns {n_over:,} of {int(bld_cov.sum()):,} building "
             f"subpixels ({over_frac * 100:.2f}%) -- "
             f"{'dropped to terrain' if overhang == 'drop' else 'kept'}")
+    elif source == "buildings":
+        empty_frac = 1.0 - bld_cov.sum() / bld_cov.size
+        log(f"[dem] {empty_frac * 100:.1f}% of pixels have no building and are NODATA "
+            f"(no terrain or DTM fill in this mode)")
     else:
         log(f"[dem] no separate building geometry, so no volume or overhang check "
             f"(source={source})")
@@ -334,6 +393,23 @@ def build_dem(terr_v, terr_f, bld_v, bld_f, domain_polygon, dtm, *, px_m=4.0, cr
         log(f"[dem] {n_missing / terr_top.size * 100:.1f}% of the raster is outside the "
             f"built domain and was filled from the island DTM (bare terrain, no buildings)")
 
+    # z_min/z_max must be read BEFORE the buildings-mode NODATA fill below, or an empty
+    # raster reads back as "flat at 0" instead of reporting its real height range.
+    z_min, z_max = float(np.nanmin(out)), float(np.nanmax(out))
+    if source == "buildings":
+        out = np.where(np.isnan(out), NODATA, out)
+
+    _notes = {
+        "surface": "Each pixel is a height (a DSM: terrain with buildings baked in).",
+        "terrain": "Each pixel is bare ground as built -- graded, with building "
+                   "footprint pads flattened in, but no buildings above it.",
+        "terrain_raw": "Each pixel is the whole-island DTM sampled directly, bypassing "
+                       "the built terrain solid entirely: no grading, no pads, no plunge "
+                       "skirts -- the ground before this domain was built. Native "
+                       "resolution is the DTM's own 20 m, regardless of pixel_size_m.",
+        "buildings": f"Each pixel is a building top height; pixels with no building are "
+                    f"nodata ({NODATA}), not filled from terrain or the DTM.",
+    }
     meta = {
         "crs": f"EPSG:{crs}", "pixel_size_m": float(px_m),
         "pixel_size_crs_units": [float(affine.a), float(-affine.e)],
@@ -341,15 +417,15 @@ def build_dem(terr_v, terr_f, bld_v, bld_f, domain_polygon, dtm, *, px_m=4.0, cr
         "tiepoint": {"pixel": [0, 0], "world": [float(affine.c), float(affine.f)]},
         "agg": agg, "overhang": overhang, "supersample": k, "source": source,
         "nodata": NODATA,
-        "z_min": float(np.nanmin(out)), "z_max": float(np.nanmax(out)),
+        "z_min": z_min, "z_max": z_max,
         "implied_building_volume_m3": vol,
         "implied_building_volume_m3_agg_max": vol_max,
         "overhang_subpixel_fraction": float(over_frac),
-        "dtm_filled_fraction": float(n_missing / terr_top.size),
-        "note": ("Each pixel is a height (a DSM: terrain with buildings baked in). North-up, "
-                 "so the georeferencing is ModelPixelScale + ModelTiepoint, not a rotated "
-                 "ModelTransformation. Sampled from the un-fused captured mesh, so it carries "
-                 "no voxel-remesh staircase or decimation error."),
+        "dtm_filled_fraction": float(n_missing / terr_top.size) if terr_top is not None else 0.0,
+        "note": (_notes[source] + " North-up, so the georeferencing is ModelPixelScale + "
+                 "ModelTiepoint, not a rotated ModelTransformation. Sampled from the "
+                 "un-fused captured mesh, so it carries no voxel-remesh staircase or "
+                 "decimation error."),
     }
     return out.astype(np.float32), affine, meta
 

@@ -1,0 +1,43 @@
+{
+  "voxel_size_m": 2.0,
+  "tooth_width_m": 4.0,
+  "tooth_thickness_m": 1.0,
+  "half_voxel_m": 1.0,
+  "results": [
+    {
+      "gap_m": 2.0,
+      "gap_collapsed_into_solid": false,
+      "faces": 140
+    },
+    {
+      "gap_m": 1.5,
+      "gap_collapsed_into_solid": true,
+      "faces": 132
+    },
+    {
+      "gap_m": 1.0,
+      "gap_collapsed_into_solid": true,
+      "faces": 132
+    },
+    {
+      "gap_m": 0.75,
+      "gap_collapsed_into_solid": true,
+      "faces": 132
+    },
+    {
+      "gap_m": 0.5,
+      "gap_collapsed_into_solid": true,
+      "faces": 132
+    },
+    {
+      "gap_m": 0.25,
+      "gap_collapsed_into_solid": true,
+      "faces": 132
+    },
+    {
+      "gap_m": 0.1,
+      "gap_collapsed_into_solid": true,
+      "faces": 132
+    }
+  ]
+}

@@ -33,6 +33,7 @@ from shapely.geometry import Polygon, box
 
 from sbg.config import DATA_DIR, SG_BUILDINGS_GEOJSON
 from sbg.onemap.client import search_buildings
+from sbg.onemap_native import dem as dem_module
 from sbg.onemap_native.ui.footprints import load_footprint_index
 from sbg.onemap_native.ui.stl_job import run_stl_job
 from sbg.onemap_native.ui.wind_plan import plan_wind
@@ -53,7 +54,7 @@ _FUSE_BACKENDS = ("meshlib", "blender")
 _DEM_AGGS = ("min", "p10", "median", "p50", "p90", "p95", "max", "mean")
 _DEM_OVERHANGS = ("keep", "drop")
 _DEM_CRS = (3414, 4326)
-_DEM_SOURCES = ("surface", "terrain")
+_DEM_SOURCES = dem_module.SOURCES
 # Serving from a job dir means a client-supplied filename reaches the filesystem.
 # Extensions the pipeline actually produces; everything else is refused outright.
 _SERVABLE_SUFFIXES = (".stl", ".json", ".tif")
@@ -242,13 +243,17 @@ def create_app(store_dir=None, dev=False):
             raise HTTPException(400, "dem_px_m must be > 0")
         # Caught here as a 400 rather than surfacing as a job traceback: the two options
         # are individually valid and only their combination is meaningless.
-        if opts.get("dem_only") and opts.get("include_base") is False:
+        # dem_source="buildings" never touches terrain (see dem.py's need_terrain), so it
+        # is the one source that stays meaningful with no terrain built.
+        _dem_needs_terrain = opts.get("dem_source", "surface") != "buildings"
+        if opts.get("dem_only") and opts.get("include_base") is False and _dem_needs_terrain:
             raise HTTPException(400, "a DEM needs terrain, so it cannot be built with "
-                                     "include_base=false")
-        if opts.get("dem") and opts.get("include_base") is False:
+                                     "include_base=false (use dem_source=buildings instead)")
+        if opts.get("dem") and opts.get("include_base") is False and _dem_needs_terrain:
             raise HTTPException(400, "dem needs terrain: include_base=false is the "
                                      "flat-ground mode (buildings on a common z=0 datum, "
-                                     "no terrain), so a height raster would be meaningless")
+                                     "no terrain), so a height raster would be meaningless "
+                                     "(use dem_source=buildings instead)")
 
         # Re-resolved server-side from the same plan_wind() the preview used, so the
         # geometry cannot drift between what the user approved and what is built. The

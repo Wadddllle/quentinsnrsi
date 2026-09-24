@@ -1,0 +1,258 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>$TITLE</title>
+<style>
+  html, body { margin:0; height:100%; background:#0b0b0e; color:#eee; font-family:system-ui,sans-serif; overflow:hidden; }
+  #canvas-wrap { position:absolute; inset:0; }
+  #ui { position:absolute; top:12px; left:12px; background:rgba(20,20,24,0.85); padding:12px 16px;
+        border-radius:10px; font-size:13px; width:280px; }
+  #ui h1 { font-size:14px; margin:0 0 8px; font-weight:600; }
+  #ui label { display:block; margin-top:10px; color:#bbb; }
+  #ui input[type=range] { width:100%; }
+  #zval { color:#fff; font-weight:600; }
+  #legend { position:absolute; bottom:16px; left:12px; width:260px; background:rgba(20,20,24,0.85);
+            padding:10px 14px; border-radius:10px; font-size:12px; }
+  #legend .bar { height:14px; width:100%; border-radius:3px;
+                 background:linear-gradient(to right, #000004, #57106e, #bc3754, #f98c0a, #fcffa4); }
+  #legend .row { display:flex; justify-content:space-between; margin-top:4px; color:#bbb; }
+  #hint { position:absolute; bottom:16px; right:16px; color:#777; font-size:11px; text-align:right; }
+  #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+             font-size:16px; color:#aaa; }
+</style>
+</head>
+<body>
+<div id="loading">loading...</div>
+<div id="canvas-wrap"></div>
+<div id="ui" style="display:none">
+  <h1>$TITLE</h1>
+  <label>XY slice height: <span id="zval">-</span> m</label>
+  <input id="zslider" type="range" min="0" max="$NZ_MINUS_1" value="0" step="1">
+  <label><input id="showpoints" type="checkbox" checked style="width:auto"> transparent volume ($N_POINTS pts)</label>
+  <label><input id="showslice" type="checkbox" checked style="width:auto"> opaque XY slice</label>
+  <label>point opacity <span id="opval">0.35</span>
+    <input id="opslider" type="range" min="0.02" max="1.0" value="0.35" step="0.01">
+  </label>
+</div>
+<div id="legend" style="display:none">
+  <div class="bar"></div>
+  <div class="row"><span>$VMIN</span><span>log10($UNIT), 2&ndash;99.8%ile</span><span>$VMAX</span></div>
+</div>
+<div id="hint">drag: rotate &middot; scroll: zoom &middot; right-drag/shift-drag: pan</div>
+
+<script>
+const THREE_SRC = $THREE_SRC_JSON;
+const CUBE_B64 = "$CUBE_B64";
+const POS_B64 = "$POS_B64";
+const POINT_BYTE_B64 = "$POINT_BYTE_B64";
+const LUT_B64 = "$LUT_B64";
+const NX=$NX, NY=$NY, NZ=$NZ, CELL_M=$CELL_M;
+const N_POINTS=$N_POINTS;
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
+  return out;
+}
+
+async function main() {
+  const blobUrl = URL.createObjectURL(new Blob([THREE_SRC], {type:'text/javascript'}));
+  const THREE = await import(blobUrl);
+
+  const cube = b64ToBytes(CUBE_B64);                     // (z,y,x) uint8, 0=no data
+  const posBytes = b64ToBytes(POS_B64);
+  const positions = new Float32Array(posBytes.buffer);   // N*3 float32 (x,y,z meters)
+  const pointByte = b64ToBytes(POINT_BYTE_B64);           // N uint8
+  const lut = b64ToBytes(LUT_B64);                        // 256*3 uint8 RGB
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0b0e);
+
+  const domainX = NX*CELL_M, domainY = NY*CELL_M, domainZ = NZ*CELL_M;
+  const center = new THREE.Vector3(domainX/2, domainY/2, domainZ/2);
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 1, 100000);
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  document.getElementById('canvas-wrap').appendChild(renderer.domElement);
+
+  // bounding box wireframe for orientation
+  const box = new THREE.Box3(new THREE.Vector3(0,0,0), new THREE.Vector3(domainX,domainY,domainZ));
+  scene.add(new THREE.Box3Helper(box, 0x444455));
+
+  // ---------------- point cloud (semi-transparent volume) ----------------
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const colors = new Float32Array(N_POINTS*3);
+  for (let i=0;i<N_POINTS;i++) {
+    const b = pointByte[i];
+    colors[i*3+0] = lut[b*3+0]/255;
+    colors[i*3+1] = lut[b*3+1]/255;
+    colors[i*3+2] = lut[b*3+2]/255;
+  }
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const pointMat = new THREE.ShaderMaterial({
+    uniforms: { opacity: { value: 0.35 }, size: { value: 6.0 } },
+    vertexShader: `
+      attribute vec3 color;
+      varying vec3 vColor;
+      uniform float size;
+      void main() {
+        vColor = color;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = size * (300.0 / -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      varying vec3 vColor;
+      uniform float opacity;
+      void main() {
+        vec2 c = gl_PointCoord - vec2(0.5);
+        float d = length(c);
+        if (d > 0.5) discard;
+        float edge = smoothstep(0.5, 0.2, d);
+        gl_FragColor = vec4(vColor, opacity * edge);
+      }`,
+    transparent: true,
+    depthWrite: false,
+  });
+  const points = new THREE.Points(geom, pointMat);
+  scene.add(points);
+
+  // ---------------- opaque adjustable XY slice ----------------
+  const sliceCanvas = document.createElement('canvas');
+  sliceCanvas.width = NX; sliceCanvas.height = NY;
+  const sctx = sliceCanvas.getContext('2d');
+  const sliceImg = sctx.createImageData(NX, NY);
+  const sliceTexture = new THREE.CanvasTexture(sliceCanvas);
+  sliceTexture.magFilter = THREE.NearestFilter;
+  sliceTexture.colorSpace = THREE.SRGBColorSpace;
+
+  function fillSlice(zIndex) {
+    const zOff = zIndex * NY * NX;
+    for (let y=0; y<NY; y++) {
+      for (let x=0; x<NX; x++) {
+        const cubeIdx = zOff + y*NX + x;
+        const b = cube[cubeIdx];
+        // canvas y=0 is the top row; flip so index y=0 lands at the plane's own
+        // -Y edge, consistent with how the point cloud positions are laid out.
+        const py = (NY - 1 - y);
+        const o = (py*NX + x) * 4;
+        if (b === 0) {
+          sliceImg.data[o]=20; sliceImg.data[o+1]=20; sliceImg.data[o+2]=24; sliceImg.data[o+3]=255;
+        } else {
+          sliceImg.data[o]  = lut[b*3+0];
+          sliceImg.data[o+1]= lut[b*3+1];
+          sliceImg.data[o+2]= lut[b*3+2];
+          sliceImg.data[o+3]= 255;
+        }
+      }
+    }
+    sctx.putImageData(sliceImg, 0, 0);
+    sliceTexture.needsUpdate = true;
+  }
+  fillSlice(0);
+
+  const sliceGeom = new THREE.PlaneGeometry(domainX, domainY);
+  const sliceMat = new THREE.MeshBasicMaterial({ map: sliceTexture, side: THREE.DoubleSide });
+  const slicePlane = new THREE.Mesh(sliceGeom, sliceMat);
+  slicePlane.position.set(domainX/2, domainY/2, CELL_M/2);
+  scene.add(slicePlane);
+
+  // ---------------- minimal orbit/pan/zoom camera control (no addon needed) ----------------
+  let radius = Math.max(domainX, domainY, domainZ) * 1.4;
+  let theta = Math.PI*0.3, phi = Math.PI*0.35;
+  let target = center.clone();
+  function updateCamera() {
+    const x = target.x + radius*Math.sin(phi)*Math.cos(theta);
+    const y = target.y + radius*Math.sin(phi)*Math.sin(theta);
+    const z = target.z + radius*Math.cos(phi);
+    camera.position.set(x,y,z);
+    camera.up.set(0,0,1);
+    camera.lookAt(target);
+  }
+  updateCamera();
+
+  const dom = renderer.domElement;
+  let dragging = null, lastX=0, lastY=0;
+  dom.addEventListener('contextmenu', e=>e.preventDefault());
+  dom.addEventListener('pointerdown', e => {
+    dragging = (e.button === 2 || e.shiftKey) ? 'pan' : 'rotate';
+    lastX = e.clientX; lastY = e.clientY;
+  });
+  window.addEventListener('pointerup', () => dragging=null);
+  window.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX-lastX, dy = e.clientY-lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    if (dragging === 'rotate') {
+      theta -= dx*0.005;
+      phi = Math.min(Math.max(phi - dy*0.005, 0.05), Math.PI-0.05);
+      updateCamera();
+    } else {
+      const panScale = radius*0.0015;
+      const forward = new THREE.Vector3().subVectors(target, camera.position).normalize();
+      const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,0,1)).normalize();
+      const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+      target.addScaledVector(right, -dx*panScale);
+      target.addScaledVector(up, dy*panScale);
+      updateCamera();
+    }
+  });
+  dom.addEventListener('wheel', e => {
+    e.preventDefault();
+    radius *= (1 + e.deltaY*0.001);
+    radius = Math.min(Math.max(radius, 10), 50000);
+    updateCamera();
+  }, {passive:false});
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // ---------------- UI wiring ----------------
+  const zslider = document.getElementById('zslider');
+  const zval = document.getElementById('zval');
+  zslider.addEventListener('input', () => {
+    const zi = parseInt(zslider.value, 10);
+    slicePlane.position.z = (zi+0.5) * CELL_M;
+    zval.textContent = ((zi+0.5) * CELL_M).toFixed(0);
+    fillSlice(zi);
+  });
+  zval.textContent = (0.5*CELL_M).toFixed(0);
+
+  document.getElementById('showpoints').addEventListener('change', e => {
+    points.visible = e.target.checked;
+  });
+  document.getElementById('showslice').addEventListener('change', e => {
+    slicePlane.visible = e.target.checked;
+  });
+  const opslider = document.getElementById('opslider');
+  const opval = document.getElementById('opval');
+  opslider.addEventListener('input', () => {
+    pointMat.uniforms.opacity.value = parseFloat(opslider.value);
+    opval.textContent = opslider.value;
+  });
+
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('ui').style.display = 'block';
+  document.getElementById('legend').style.display = 'block';
+
+  function animate() {
+    requestAnimationFrame(animate);
+    renderer.render(scene, camera);
+  }
+  animate();
+}
+main().catch(err => {
+  document.getElementById('loading').textContent = 'error: ' + err.message;
+  console.error(err);
+});
+</script>
+</body>
+</html>

@@ -51,3 +51,7 @@ doc/*.pdf
 /NationalMapLine.geojson
 /onemap_landmarks/exports/
 /onemap_landmarks/renders/
+/kelvins_0penmc/*npy
+/kelvins_0penmc/*npz
+/kelvins_0penmc/*npz
+/kelvins_0penmc/openmc_run

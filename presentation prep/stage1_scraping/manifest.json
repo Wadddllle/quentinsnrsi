@@ -1,0 +1,106 @@
+[
+  {
+    "label": "stadium_coarse_1_4",
+    "note": "coarsest rung, single-building chain",
+    "tile_uri": "https://www.onemap.gov.sg/omapi/tilesets/sg_noterrain_tiles/3/5/1_4.b3dm",
+    "geometricError": 367.7,
+    "b3dm_bytes": 68880,
+    "draco_geometry_bytes": 65690,
+    "embedded_texture_bytes": 317,
+    "n_meshes": 1,
+    "n_buildings_in_batch_table": 1,
+    "building_names": [
+      "NATIONAL STADIUM"
+    ],
+    "stl_file": "stadium_coarse_1_4.stl",
+    "n_vertices": 16616,
+    "n_faces": 5976,
+    "bbox_z_m": [
+      0.0009023416787385941,
+      84.19839649274945
+    ]
+  },
+  {
+    "label": "stadium_fine_1_0",
+    "note": "finest rung, single-building chain",
+    "tile_uri": "https://www.onemap.gov.sg/omapi/tilesets/sg_noterrain_tiles/3/5/1_0.b3dm",
+    "geometricError": 0.0,
+    "b3dm_bytes": 9476792,
+    "draco_geometry_bytes": 65690,
+    "embedded_texture_bytes": 9408235,
+    "n_meshes": 1,
+    "n_buildings_in_batch_table": 1,
+    "building_names": [
+      "NATIONAL STADIUM"
+    ],
+    "stl_file": "stadium_fine_1_0.stl",
+    "n_vertices": 16616,
+    "n_faces": 5976,
+    "bbox_z_m": [
+      0.0009023416787385941,
+      84.19839649274945
+    ]
+  },
+  {
+    "label": "kallang_cluster_coarse_4_5",
+    "note": "coarsest rung, 20-building batch",
+    "tile_uri": "https://www.onemap.gov.sg/omapi/tilesets/sg_noterrain_tiles/5/21/4_5.b3dm",
+    "geometricError": 249.0,
+    "b3dm_bytes": 90464,
+    "draco_geometry_bytes": 76563,
+    "embedded_texture_bytes": 7467,
+    "n_meshes": 1,
+    "n_buildings_in_batch_table": 20,
+    "building_names": [
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "STADIUM MRT STATION",
+      "KALLANG THEATRE",
+      "SINGAPORE INDOOR STADIUM"
+    ],
+    "stl_file": "kallang_cluster_coarse_4_5.stl",
+    "n_vertices": 19120,
+    "n_faces": 6872,
+    "bbox_z_m": [
+      3.7159770727157593e-07,
+      49.4730976652354
+    ]
+  },
+  {
+    "label": "kallang_cluster_fine_4_0",
+    "note": "finest rung, 20-building batch",
+    "tile_uri": "https://www.onemap.gov.sg/omapi/tilesets/sg_noterrain_tiles/5/21/4_0.b3dm",
+    "geometricError": 0.0,
+    "b3dm_bytes": 15905052,
+    "draco_geometry_bytes": 82501,
+    "embedded_texture_bytes": 15812306,
+    "n_meshes": 4,
+    "n_buildings_in_batch_table": 20,
+    "building_names": [
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "KALLANG PARK",
+      "STADIUM MRT STATION",
+      "KALLANG THEATRE",
+      "SINGAPORE INDOOR STADIUM"
+    ],
+    "stl_file": "kallang_cluster_fine_4_0.stl",
+    "n_vertices": 19120,
+    "n_faces": 6872,
+    "bbox_z_m": [
+      3.7159770727157593e-07,
+      49.47309874650091
+    ]
+  }
+]
